@@ -1,0 +1,69 @@
+{
+  "name": "dsh-composer-md-preview",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Renders your own messages as Markdown in DeepSeek Harness: a live preview card above the composer, and sent messages rendered in the transcript",
+  "keywords": [
+    "dsh-plugin",
+    "dsh",
+    "deepseek-harness",
+    "composer",
+    "markdown",
+    "preview"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wangjiaxi/dsh-composer-md-preview.git"
+  },
+  "homepage": "https://github.com/wangjiaxi/dsh-composer-md-preview#readme",
+  "bugs": {
+    "url": "https://github.com/wangjiaxi/dsh-composer-md-preview/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "icon.svg",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "validate": "node scripts/validate.mjs"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "engines": {
+      "dsh": ">=0.2.2-rc.3 <0.3.0"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

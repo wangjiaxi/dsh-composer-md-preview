@@ -1,0 +1,1037 @@
+/* eslint-disable */
+/**
+ * Client half of `dsh-composer-md-preview`.
+ *
+ * Three slot entries, one idea: your own text reads as Markdown, not as
+ * markers.
+ *
+ *  - `conversation.input.dock` (`composer-md-preview`, order 10) — a card
+ *    docked directly above the composer card that renders the live draft as
+ *    Markdown. It reads the draft through the slot's `useInput` standard hook,
+ *    so it repaints on every edit without subscribing to the session itself.
+ *  - `conversation.input.left` (`composer-md-preview-toggle`, order 100) — the
+ *    MD pill in the composer tool row: the master switch for both halves.
+ *  - `conversation.user.text.node` (`key: 'text'`, priority 50) — renders a sent
+ *    message as Markdown inside its existing bubble, shadowing the shipped
+ *    plain-text run for that key (keyed dispatch renders the lowest priority).
+ *
+ * The Markdown pipeline is local: a small GFM-subset block/inline parser that
+ * produces plain data, and a React renderer that turns that data into themed
+ * elements. Nothing is imported from Harness Client packages, so a renamed
+ * internal primitive cannot blank the slot entry or a transcript; only theme
+ * tokens are used for color, type and elevation.
+ *
+ * Authored as a lazy CommonJS factory for the Web module loader: running the
+ * bundle only registers the factory, and `apply` holds every side effect
+ * (dictionary, stylesheet, slot registrations) inside `ctx.effect`.
+ */
+window.__ModuleLoader__.load({
+	id: "dsh-composer-md-preview",
+	factory: (require) => {
+		var module = { exports: {} };
+		var exports = module.exports;
+
+		const React = require('react');
+		const h = React.createElement;
+
+		/** Locale namespace owned by this plugin. */
+		const NS = 'dsh-composer-md-preview';
+		/** localStorage key holding the two persisted preferences. */
+		const STORAGE_KEY = 'dsh-composer-md-preview/v1';
+		/** Text longer than this is not rendered: this is a reading aid, not a document viewer. */
+		const MAX_RENDER_CHARS = 50000;
+
+		// #region preferences
+		/**
+		 * Persisted preferences, shared by both slot entries.
+		 *
+		 * `enabled` is the user's switch (the MD pill and the card's × both write
+		 * it). `collapsed` is the card's own disclosure state; it survives a
+		 * remount so switching sessions does not reopen a card the user folded.
+		 */
+		let prefs = { enabled: true, collapsed: false };
+		let prefsSnapshot = prefs;
+		const prefsListeners = new Set();
+
+		function readPrefs() {
+			try {
+				const raw = window.localStorage.getItem(STORAGE_KEY);
+				if (raw === null) return;
+				const parsed = JSON.parse(raw);
+				if (parsed === null || typeof parsed !== 'object') return;
+				if (typeof parsed.enabled === 'boolean') prefs.enabled = parsed.enabled;
+				if (typeof parsed.collapsed === 'boolean') prefs.collapsed = parsed.collapsed;
+				prefsSnapshot = { ...prefs };
+			} catch (error) {
+				console.warn('[composer-md-preview] could not read preferences', error);
+			}
+		}
+
+		function writePrefs() {
+			try {
+				window.localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
+			} catch (error) {
+				console.warn('[composer-md-preview] could not persist preferences', error);
+			}
+		}
+
+		/** Merge one patch into the snapshot, persist it, and wake both entries. */
+		function commitPrefs(patch) {
+			prefsSnapshot = { ...prefsSnapshot, ...patch };
+			prefs = { ...prefsSnapshot };
+			writePrefs();
+			for (const listener of [...prefsListeners]) {
+				try {
+					listener();
+				} catch (error) {
+					console.error('[composer-md-preview] preference listener failed', error);
+				}
+			}
+		}
+
+		function subscribePrefs(listener) {
+			prefsListeners.add(listener);
+			return () => {
+				prefsListeners.delete(listener);
+			};
+		}
+
+		function getPrefs() {
+			return prefsSnapshot;
+		}
+
+		function usePrefs() {
+			return React.useSyncExternalStore(subscribePrefs, getPrefs, getPrefs);
+		}
+		// #endregion
+
+		// #region detection
+		/**
+		 * Conservative Markdown fingerprints. The card shows only after one of
+		 * these matches, so ordinary prose never duplicates itself above the
+		 * composer; a false negative is silent, while a false positive would be
+		 * pure noise.
+		 */
+		const MARKDOWN_HINTS = [
+			/(^|\n) {0,3}#{1,6}([ \t]|$)/, // ATX heading
+			/(^|\n) {0,3}>[ \t]?/, // blockquote
+			/(^|\n) {0,3}(`{3,}|~{3,})/, // fenced code
+			/(^|\n) {0,3}([-*+]|\d{1,9}[.)])[ \t]+\S/, // list item
+			/(^|\n) {0,3}([-*_])[ \t]*(?:\2[ \t]*){2,}$/, // thematic break
+			/(^|\n) {0,3}\|?[ \t]*:?-{2,}:?[ \t]*\|/, // table separator row
+			/`[^`\n]+`/, // inline code
+			/\*\*[^*\n]+\*\*/, // strong
+			/(^|[^\w])__[^_\n]+__/, // strong (underscore)
+			/(^|[^*\w])\*[^*\s][^*\n]*\*/, // emphasis
+			/\b_[^_\n]+_\b/, // emphasis (underscore)
+			/~~[^~\n]+~~/, // strikethrough
+			/!?\[[^\]\n]*\]\([^)\n]+\)/, // link or image
+			/(^|\n) {0,3}<(?:https?|mailto):[^>\s]+>/, // autolink
+		];
+
+		/** @returns whether the draft carries any Markdown syntax worth previewing. */
+		function looksLikeMarkdown(text) {
+			if (typeof text !== 'string' || text.trim() === '') return false;
+			for (const hint of MARKDOWN_HINTS) if (hint.test(text)) return true;
+			return false;
+		}
+		// #endregion
+
+		// #region inline parser
+		/** Characters that a backslash may escape. */
+		const ESCAPABLE = '\\`*_{}[]()#+-.!>~|';
+		const WORD = /[0-9A-Za-z\u00C0-\uFFFF]/;
+
+		/**
+		 * Read `[label](destination "title")` starting at the `[`.
+		 * @param text - source string.
+		 * @param at - index of `[`.
+		 * @returns label, destination, title, and the index after `)`, or null.
+		 */
+		function readLinkLike(text, at) {
+			let depth = 0;
+			let cursor = at;
+			for (; cursor < text.length; cursor += 1) {
+				const ch = text[cursor];
+				if (ch === '\\') {
+					cursor += 1;
+					continue;
+				}
+				if (ch === '[') depth += 1;
+				else if (ch === ']') {
+					depth -= 1;
+					if (depth === 0) break;
+				}
+			}
+			if (cursor >= text.length || text[cursor] !== ']' || text[cursor + 1] !== '(') return null;
+			const label = text.slice(at + 1, cursor);
+			let parens = 0;
+			let end = cursor + 2;
+			for (; end < text.length; end += 1) {
+				const ch = text[end];
+				if (ch === '\\') {
+					end += 1;
+					continue;
+				}
+				if (ch === '(') parens += 1;
+				else if (ch === ')') {
+					if (parens === 0) break;
+					parens -= 1;
+				}
+			}
+			if (end >= text.length) return null;
+			let raw = text.slice(cursor + 2, end).trim();
+			if (raw.startsWith('<') && raw.endsWith('>')) raw = raw.slice(1, -1).trim();
+			const parts = raw.split(/\s+/);
+			const destination = parts.shift() ?? '';
+			let title = parts.join(' ').trim();
+			if (title.startsWith('"') || title.startsWith("'") || title.startsWith('(')) title = title.slice(1);
+			if (title.endsWith('"') || title.endsWith("'") || title.endsWith(')')) title = title.slice(0, -1);
+			return { label, destination, title, end: end + 1 };
+		}
+
+		/**
+		 * Find the closing marker of an emphasis span.
+		 * A single-character marker must not close inside a longer run, so
+		 * `*a **b** c*` closes on the last `*` and keeps the strong span inside.
+		 * @param text - source string.
+		 * @param from - index just after the opening marker.
+		 * @param marker - the opening marker, one or two characters.
+		 * @returns the closing index, or -1.
+		 */
+		function findEmphasisClose(text, from, marker) {
+			let index = text.indexOf(marker, from);
+			while (index !== -1) {
+				if (marker.length > 1) return index;
+				// A single marker never closes inside a run (`**`, `~~`, ...): the
+				// run belongs to the inner span or stays literal.
+				if (text[index - 1] !== marker && text[index + 1] !== marker) return index;
+				index = text.indexOf(marker, index + 1);
+			}
+			return -1;
+		}
+
+		/**
+		 * Read emphasis, strong, or strikethrough starting at a marker character.
+		 * @returns tag, inner source, and the index after the closing marker, or null.
+		 */
+		function readEmphasis(text, at) {
+			const ch = text[at];
+			const candidates = ch === '~'
+				? [['~~', 'del']]
+				: ch === '*'
+					? [['**', 'strong'], ['*', 'em']]
+					: [['__', 'strong'], ['_', 'em']];
+			for (const [marker, tag] of candidates) {
+				if (!text.startsWith(marker, at)) continue;
+				// A run of three or more markers is left literal: half-parsed
+				// bold+italic reads worse than the raw text a user typed.
+				if (text[at + marker.length] === marker[0]) continue;
+				// Snake_case and intraword underscores are not emphasis in GFM.
+				if (marker[0] === '_' && at > 0 && WORD.test(text[at - 1])) continue;
+				const from = at + marker.length;
+				const close = findEmphasisClose(text, from, marker);
+				if (close <= from) continue;
+				const inner = text.slice(from, close);
+				if (inner.trim() === '') continue;
+				if (marker[0] === '_' && close + marker.length < text.length && WORD.test(text[close + marker.length])) continue;
+				return { tag, inner, end: close + marker.length };
+			}
+			return null;
+		}
+
+		/** Nesting cap for both parsers: a hostile draft must not overflow the stack. */
+		const MAX_DEPTH = 8;
+
+		/**
+		 * Split inline Markdown into plain data nodes.
+		 * @param text - one line or span of source.
+		 * @param depth - nesting level; beyond {@link MAX_DEPTH} the span stays literal.
+		 * @returns nodes for {@link renderInline}.
+		 */
+		function parseInline(text, depth = 0) {
+			if (depth >= MAX_DEPTH) return [{ type: 'text', value: text }];
+			const nodes = [];
+			let buffer = '';
+			let index = 0;
+			const flush = () => {
+				if (buffer !== '') {
+					nodes.push({ type: 'text', value: buffer });
+					buffer = '';
+				}
+			};
+			while (index < text.length) {
+				const ch = text[index];
+				if (ch === '\\' && index + 1 < text.length && ESCAPABLE.includes(text[index + 1])) {
+					buffer += text[index + 1];
+					index += 2;
+					continue;
+				}
+				if (ch === '`') {
+					const close = text.indexOf('`', index + 1);
+					if (close > index + 1) {
+						flush();
+						nodes.push({ type: 'code', value: text.slice(index + 1, close).replace(/^ (.*) $/, '$1') });
+						index = close + 1;
+						continue;
+					}
+				}
+				if (ch === '!' && text[index + 1] === '[') {
+					const image = readLinkLike(text, index + 1);
+					if (image !== null) {
+						flush();
+						nodes.push({ type: 'image', alt: image.label, src: image.destination });
+						index = image.end;
+						continue;
+					}
+				}
+				if (ch === '[') {
+					const link = readLinkLike(text, index);
+					if (link !== null) {
+						flush();
+						nodes.push({ type: 'link', href: link.destination, title: link.title, nodes: parseInline(link.label, depth + 1) });
+						index = link.end;
+						continue;
+					}
+				}
+				if (ch === '<') {
+					const autolink = /^<((?:https?|mailto):[^\s<>]+)>/.exec(text.slice(index));
+					if (autolink !== null) {
+						flush();
+						nodes.push({ type: 'link', href: autolink[1], title: '', nodes: [{ type: 'text', value: autolink[1] }] });
+						index += autolink[0].length;
+						continue;
+					}
+				}
+				if (ch === '*' || ch === '_' || ch === '~') {
+					const emphasis = readEmphasis(text, index);
+					if (emphasis !== null) {
+						flush();
+						nodes.push({ type: emphasis.tag, nodes: parseInline(emphasis.inner, depth + 1) });
+						index = emphasis.end;
+						continue;
+					}
+				}
+				buffer += ch;
+				index += 1;
+			}
+			flush();
+			return nodes;
+		}
+		// #endregion
+
+		// #region block parser
+		const LIST_MARKER = /^([ \t]*)(?:([-*+])|(\d{1,9})([.)]))([ \t]+|$)/;
+		const TASK_MARKER = /^\[([ xX])\][ \t]+(.*)$/;
+
+		/** Count leading indentation in columns, treating a tab as four spaces. */
+		function indentOf(line) {
+			let width = 0;
+			for (const ch of line) {
+				if (ch === ' ') width += 1;
+				else if (ch === '\t') width += 4;
+				else break;
+			}
+			return width;
+		}
+
+		/** Remove at most `count` leading spaces (tabs count as four). */
+		function dedent(line, count) {
+			let removed = 0;
+			let index = 0;
+			while (index < line.length && removed < count) {
+				if (line[index] === ' ') {
+					removed += 1;
+					index += 1;
+					continue;
+				}
+				if (line[index] === '\t' && removed + 4 <= count + 3) {
+					removed += 4;
+					index += 1;
+					continue;
+				}
+				break;
+			}
+			return line.slice(index);
+		}
+
+		function matchListMarker(line) {
+			const match = LIST_MARKER.exec(line);
+			if (match === null) return null;
+			const ordered = match[3] !== undefined;
+			return {
+				indent: indentOf(match[1]),
+				ordered,
+				number: ordered ? Number(match[3]) : 1,
+				/** Content column: where this item's own text begins. */
+				column: match[0].length,
+				rest: line.slice(match[0].length),
+			};
+		}
+
+		function isBlockStart(line) {
+			if (/^ {0,3}(`{3,}|~{3,})/.test(line)) return true;
+			if (/^ {0,3}#{1,6}([ \t]|$)/.test(line)) return true;
+			if (/^ {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$/.test(line)) return true;
+			if (/^ {0,3}>/.test(line)) return true;
+			return matchListMarker(line) !== null;
+		}
+
+		/** Split one table row into trimmed cell sources, honoring `\|` escapes. */
+		function splitTableRow(line) {
+			let body = line.trim();
+			if (body.startsWith('|')) body = body.slice(1);
+			if (body.endsWith('|') && !body.endsWith('\\|')) body = body.slice(0, -1);
+			const cells = [];
+			let cell = '';
+			for (let index = 0; index < body.length; index += 1) {
+				const ch = body[index];
+				if (ch === '\\' && body[index + 1] === '|') {
+					cell += '|';
+					index += 1;
+					continue;
+				}
+				if (ch === '|') {
+					cells.push(cell);
+					cell = '';
+					continue;
+				}
+				cell += ch;
+			}
+			cells.push(cell);
+			return cells;
+		}
+
+		/** Read a GFM table starting at `start`, or null when the shape does not hold. */
+		function readTable(lines, start) {
+			const head = lines[start];
+			if (!head.includes('|')) return null;
+			const separator = lines[start + 1];
+			if (separator === undefined || !separator.includes('|')) return null;
+			const headCells = splitTableRow(head);
+			const separatorCells = splitTableRow(separator);
+			if (separatorCells.length !== headCells.length) return null;
+			if (!separatorCells.every(cell => /^:?-+:?$/.test(cell.trim()))) return null;
+			const align = separatorCells.map(cell => {
+				const value = cell.trim();
+				const left = value.startsWith(':');
+				const right = value.endsWith(':');
+				if (left && right) return 'center';
+				if (right) return 'right';
+				if (left) return 'left';
+				return '';
+			});
+			const rows = [];
+			let index = start + 2;
+			while (index < lines.length && lines[index].trim() !== '' && lines[index].includes('|')) {
+				rows.push(splitTableRow(lines[index]).map(cell => parseInline(cell.trim())));
+				index += 1;
+			}
+			return {
+				node: {
+					type: 'table',
+					align,
+					head: headCells.map(cell => parseInline(cell.trim())),
+					rows,
+				},
+				next: index,
+			};
+		}
+
+		/** Read one list (and its nested lists) starting at `start`. */
+		function readList(lines, start, depth) {
+			const first = matchListMarker(lines[start]);
+			const base = first.indent;
+			const ordered = first.ordered;
+			const items = [];
+			let index = start;
+			while (index < lines.length) {
+				const marker = matchListMarker(lines[index]);
+				if (marker === null || marker.indent !== base || marker.ordered !== ordered) break;
+				let rest = marker.rest;
+				let checked;
+				const task = TASK_MARKER.exec(rest);
+				if (task !== null) {
+					checked = task[1] !== ' ';
+					rest = task[2];
+				}
+				const content = [rest];
+				const column = marker.column;
+				index += 1;
+				while (index < lines.length) {
+					const line = lines[index];
+					if (line.trim() === '') {
+						// A blank line continues the item only when indented content follows.
+						let probe = index;
+						while (probe < lines.length && lines[probe].trim() === '') probe += 1;
+						if (probe >= lines.length) {
+							index = probe;
+							break;
+						}
+						const nextMarker = matchListMarker(lines[probe]);
+						const keeps = nextMarker !== null ? nextMarker.indent >= base : indentOf(lines[probe]) > base;
+						if (!keeps) break;
+						content.push('');
+						index = probe;
+						continue;
+					}
+					const nested = matchListMarker(line);
+					const indent = indentOf(line);
+					if (nested !== null && nested.indent > base) {
+						// Absorption: take following lines deeper than the item's own
+						// marker, dedented so the nested list parses at column zero.
+						content.push('');
+						while (index < lines.length) {
+							const deeper = lines[index];
+							if (deeper.trim() === '') {
+								content.push('');
+								index += 1;
+								continue;
+							}
+							if (indentOf(deeper) > base) {
+								content.push(dedent(deeper, column));
+								index += 1;
+								continue;
+							}
+							break;
+						}
+						continue;
+					}
+					if (nested !== null && nested.indent === base) break;
+					if (indent > base) {
+						content.push(dedent(line, column));
+						index += 1;
+						continue;
+					}
+					if (indent <= base && nested === null) {
+						// Lazy continuation: an unindented line still belongs to the item.
+						content.push(line.trim());
+						index += 1;
+						continue;
+					}
+					break;
+				}
+				items.push({ checked, blocks: parseBlocks(content.join('\n'), depth + 1) });
+			}
+			return { node: { type: 'list', ordered, start: first.number, items }, next: index };
+		}
+
+		/**
+		 * Parse Markdown source into block data.
+		 * @param source - the whole draft.
+		 * @param depth - nesting level; beyond {@link MAX_DEPTH} the source stays a paragraph.
+		 * @returns block nodes consumed by {@link renderBlocks}.
+		 */
+		function parseBlocks(source, depth = 0) {
+			if (depth >= MAX_DEPTH) return [{ type: 'paragraph', nodes: parseInline(String(source)) }];
+			const lines = String(source).replace(/\r\n?/g, '\n').split('\n');
+			const blocks = [];
+			let index = 0;
+			while (index < lines.length) {
+				const line = lines[index];
+				if (line.trim() === '') {
+					index += 1;
+					continue;
+				}
+				const fence = /^ {0,3}(`{3,}|~{3,})[ \t]*(.*)$/.exec(line);
+				if (fence !== null) {
+					const marker = fence[1];
+					const lang = (fence[2].trim().split(/\s+/)[0] ?? '').replace(/[`~]/g, '');
+					const closing = new RegExp(`^ {0,3}${marker[0] === '`' ? '`' : '~'}{${marker.length},}[ \\t]*$`);
+					const body = [];
+					index += 1;
+					while (index < lines.length && !closing.test(lines[index])) {
+						body.push(lines[index]);
+						index += 1;
+					}
+					if (index < lines.length) index += 1;
+					blocks.push({ type: 'code', lang, value: body.join('\n') });
+					continue;
+				}
+				const heading = /^ {0,3}(#{1,6})[ \t]*(.*)$/.exec(line);
+				if (heading !== null) {
+					const text = heading[2].replace(/\s+#+\s*$/, '');
+					blocks.push({ type: 'heading', level: heading[1].length, nodes: parseInline(text) });
+					index += 1;
+					continue;
+				}
+				if (/^ {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$/.test(line)) {
+					blocks.push({ type: 'hr' });
+					index += 1;
+					continue;
+				}
+				if (/^ {0,3}>/.test(line)) {
+					const quoted = [];
+					while (index < lines.length && /^ {0,3}>/.test(lines[index])) {
+						quoted.push(lines[index].replace(/^ {0,3}>[ \t]?/, ''));
+						index += 1;
+					}
+					blocks.push({ type: 'quote', blocks: parseBlocks(quoted.join('\n'), depth + 1) });
+					continue;
+				}
+				const table = readTable(lines, index);
+				if (table !== null) {
+					blocks.push(table.node);
+					index = table.next;
+					continue;
+				}
+				const marker = matchListMarker(line);
+				if (marker !== null) {
+					const list = readList(lines, index, depth);
+					blocks.push(list.node);
+					index = list.next;
+					continue;
+				}
+				// Paragraph: soft line breaks are kept as breaks, because every
+				// newline in a composer is a key the user pressed on purpose.
+				const nodes = [];
+				let first = true;
+				while (index < lines.length && lines[index].trim() !== '' && (first || !isBlockStart(lines[index]))) {
+					if (!first) nodes.push({ type: 'break' });
+					nodes.push(...parseInline(lines[index].trim()));
+					first = false;
+					index += 1;
+				}
+				blocks.push({ type: 'paragraph', nodes });
+			}
+			return blocks;
+		}
+		// #endregion
+
+		// #region renderer
+		const SAFE_PROTOCOL = /^(?:https?|mailto):/i;
+
+		/**
+		 * Render inline nodes.
+		 * @param nodes - data from {@link parseInline}.
+		 * @param labels - localized chrome (`image` placeholder text).
+		 * @returns React children.
+		 */
+		function renderInline(nodes, labels) {
+			return (nodes ?? []).map((node, index) => {
+				const key = `i${index}`;
+				switch (node.type) {
+					case 'text':
+						return node.value;
+					case 'break':
+						return h('br', { key });
+					case 'code':
+						return h('code', { key, className: 'dcmp-inline-code' }, node.value);
+					case 'strong':
+						return h('strong', { key }, renderInline(node.nodes, labels));
+					case 'em':
+						return h('em', { key }, renderInline(node.nodes, labels));
+					case 'del':
+						return h('del', { key }, renderInline(node.nodes, labels));
+					case 'link': {
+						// Only http(s) and mailto become anchors; a local path or an
+						// unknown protocol keeps its label as plain text.
+						if (!SAFE_PROTOCOL.test(node.href)) return h('span', { key }, renderInline(node.nodes, labels));
+						return h(
+							'a',
+							{ key, className: 'dcmp-link', href: node.href, title: node.title || undefined, target: '_blank', rel: 'noreferrer noopener' },
+							renderInline(node.nodes, labels),
+						);
+					}
+					case 'image':
+						return h(
+							'span',
+							{ key, className: 'dcmp-image', title: node.src },
+							h('span', { className: 'dcmp-image-mark', 'aria-hidden': 'true' }),
+							node.alt || labels.image,
+						);
+					default:
+						return typeof node.value === 'string' ? node.value : null;
+				}
+			});
+		}
+
+		/**
+		 * Render block nodes.
+		 * @param blocks - data from {@link parseBlocks}.
+		 * @param labels - localized chrome.
+		 * @returns a React child list.
+		 */
+		function renderBlocks(blocks, labels) {
+			return (blocks ?? []).map((block, index) => renderBlock(block, `b${index}`, labels));
+		}
+
+		function renderBlock(block, key, labels) {
+			switch (block.type) {
+				case 'paragraph':
+					return h('p', { key }, renderInline(block.nodes, labels));
+				case 'heading': {
+					const tag = `h${Math.min(6, Math.max(1, block.level))}`;
+					return h(tag, { key, className: 'dcmp-heading' }, renderInline(block.nodes, labels));
+				}
+				case 'hr':
+					return h('hr', { key, className: 'dcmp-rule' });
+				case 'code':
+					return h(
+						'div',
+						{ key, className: 'dcmp-code' },
+						block.lang === '' ? null : h('span', { className: 'dcmp-code-lang' }, block.lang),
+						h('pre', null, h('code', null, block.value)),
+					);
+				case 'quote':
+					return h('blockquote', { key, className: 'dcmp-quote' }, renderBlocks(block.blocks, labels));
+				case 'list': {
+					const tag = block.ordered ? 'ol' : 'ul';
+					return h(
+						tag,
+						{ key, className: 'dcmp-list', start: block.ordered && block.start !== 1 ? block.start : undefined },
+						block.items.map((item, itemIndex) => {
+							const onlyParagraph = item.blocks.length === 1 && item.blocks[0].type === 'paragraph';
+							const body = onlyParagraph
+								? renderInline(item.blocks[0].nodes, labels)
+								: renderBlocks(item.blocks, labels);
+							const task = item.checked === undefined;
+							return h(
+								'li',
+								{ key: `${key}-${itemIndex}`, className: task ? 'dcmp-item' : 'dcmp-item dcmp-task' },
+								task ? null : h('input', {
+									type: 'checkbox',
+									className: 'dcmp-check',
+									checked: item.checked === true,
+									readOnly: true,
+									disabled: true,
+									tabIndex: -1,
+									'aria-label': item.checked ? labels.checked : labels.unchecked,
+								}),
+								body,
+							);
+						}),
+					);
+				}
+				case 'table':
+					return h(
+						'div',
+						{ key, className: 'dcmp-tablewrap' },
+						h(
+							'table',
+							{ className: 'dcmp-table' },
+							h('thead', null, h('tr', null, block.head.map((cell, cellIndex) => h(
+								'th',
+								{ key: `h${cellIndex}`, style: block.align[cellIndex] ? { textAlign: block.align[cellIndex] } : undefined },
+								renderInline(cell, labels),
+							)))),
+							h('tbody', null, block.rows.map((row, rowIndex) => h(
+								'tr',
+								{ key: `r${rowIndex}` },
+								row.map((cell, cellIndex) => h(
+									'td',
+									{ key: `c${cellIndex}`, style: block.align[cellIndex] ? { textAlign: block.align[cellIndex] } : undefined },
+									renderInline(cell, labels),
+								)),
+							))),
+						),
+					);
+				default:
+					return null;
+			}
+		}
+		// #endregion
+
+		// #region components
+		/** Icon: a chevron, drawn inline so the plugin needs no icon package. */
+		function Chevron({ open }) {
+			return h(
+				'svg',
+				{ className: 'dcmp-chevron', viewBox: '0 0 12 12', width: 12, height: 12, 'aria-hidden': 'true', 'data-open': open ? 'true' : 'false' },
+				h('path', {
+					d: 'M3 4.75 6 7.75l3-3',
+					fill: 'none',
+					stroke: 'currentColor',
+					strokeWidth: 1.5,
+					strokeLinecap: 'round',
+					strokeLinejoin: 'round',
+				}),
+			);
+		}
+
+		/** Fallback hook keeps the render hook order stable when no input seat exists. */
+		function useNoInput() {
+			return '';
+		}
+
+		function selectDraft(state) {
+			return state !== null && typeof state === 'object' && typeof state.draft === 'string' ? state.draft : '';
+		}
+
+		/**
+		 * The docked preview card.
+		 * @param props - slot props: `useInput` standard hook, `t` locale seat, and
+		 * the `conversation.input.dock` owner zone (unused, read through the hook).
+		 */
+		function PreviewDock({ useInput, t }) {
+			const translate = typeof t === 'function' ? t : key => key;
+			const prefsNow = usePrefs();
+			const bodyId = React.useId();
+			const draft = (typeof useInput === 'function' ? useInput : useNoInput)(selectDraft);
+			// Detection reads the whole draft (a cheap scan); the parse below only
+			// runs for the part that is actually rendered.
+			const overflow = draft.length > MAX_RENDER_CHARS;
+			const text = overflow ? draft.slice(0, MAX_RENDER_CHARS) : draft;
+			const visible = prefsNow.enabled && text.trim() !== '' && looksLikeMarkdown(draft);
+			const showBody = visible && !prefsNow.collapsed && !overflow;
+			const blocks = React.useMemo(() => (showBody ? parseBlocks(text) : null), [showBody, text]);
+			if (!visible) return null;
+
+			const labels = {
+				image: translate('image'),
+				checked: translate('checked'),
+				unchecked: translate('unchecked'),
+			};
+			const meta = overflow
+				? translate('meta.overflow', { chars: draft.length })
+				: translate('meta', { lines: text.split('\n').length, chars: text.length });
+
+			return h(
+				'section',
+				{ className: 'dcmp-card', 'data-dsh-md-preview': '', 'aria-label': translate('title') },
+				h(
+					'div',
+					{ className: 'dcmp-head' },
+					h(
+						'button',
+						{
+							type: 'button',
+							className: 'dcmp-headbtn',
+							'aria-expanded': !prefsNow.collapsed,
+							'aria-controls': overflow ? undefined : bodyId,
+							title: prefsNow.collapsed ? translate('expand') : translate('collapse'),
+							onMouseDown: event => event.preventDefault(),
+							onClick: () => commitPrefs({ collapsed: !prefsNow.collapsed }),
+						},
+						h('span', { className: 'dcmp-badge', 'aria-hidden': 'true' }, 'MD'),
+						h('span', { className: 'dcmp-title' }, translate('title')),
+						h('span', { className: 'dcmp-meta' }, meta),
+						h(Chevron, { open: !prefsNow.collapsed }),
+					),
+				),
+				showBody && blocks !== null
+					? h(
+						'div',
+						{ className: 'dcmp-body', id: bodyId, role: 'region', tabIndex: 0, 'aria-label': translate('body.label') },
+						h('div', { className: 'dcmp-md' }, renderBlocks(blocks, labels)),
+					)
+					: null,
+			);
+		}
+
+		/**
+		 * The MD pill in the composer tool row.
+		 * @param props - slot props: `t` locale seat.
+		 */
+		function PreviewToggle({ t }) {
+			const translate = typeof t === 'function' ? t : key => key;
+			const prefsNow = usePrefs();
+			const on = prefsNow.enabled;
+			return h(
+				'button',
+				{
+					type: 'button',
+					className: 'dcmp-toggle',
+					'aria-pressed': on,
+					'aria-label': translate('toggle.label'),
+					title: on ? translate('toggle.on') : translate('toggle.off'),
+					onMouseDown: event => event.preventDefault(),
+					onClick: () => commitPrefs({ enabled: !on }),
+				},
+				h('span', { className: 'dcmp-toggle-mark', 'aria-hidden': 'true' }, 'MD'),
+				h('span', { className: 'dcmp-dot', 'data-on': on ? 'true' : 'false', 'aria-hidden': 'true' }),
+			);
+		}
+
+		/**
+		 * Render one sent user message as Markdown inside its existing bubble.
+		 *
+		 * The transcript ships a plain-text renderer for the `text` node of
+		 * `conversation.user.text.node`; this entry shadows it at a lower priority
+		 * so a message reads the way the composer preview showed it. Anything the
+		 * renderer declines (no Markdown, a parse failure, an oversized message)
+		 * falls back to the plain run, so a message can never disappear or crash
+		 * with the rest of the transcript.
+		 * @param props - node data, the raw slice, and the locale seat.
+		 */
+		function UserMarkdown({ node, raw, t }) {
+			const translate = typeof t === 'function' ? t : key => key;
+			const prefsNow = usePrefs();
+			const data = node !== null && typeof node === 'object' ? node.data : undefined;
+			const display = data !== null && typeof data === 'object' ? data.display : undefined;
+			const text = typeof display === 'string' ? display : (typeof raw === 'string' ? raw : '');
+			const markdown = prefsNow.enabled && text.length <= MAX_RENDER_CHARS && looksLikeMarkdown(text);
+			// Memoized per (text, switch): a transcript re-renders often while the
+			// assistant streams, and a message's parse never changes underneath it.
+			const blocks = React.useMemo(() => {
+				if (!markdown) return null;
+				try {
+					return parseBlocks(text);
+				} catch (error) {
+					console.error('[composer-md-preview] could not render a sent message', error);
+					return null;
+				}
+			}, [markdown, text]);
+			if (blocks === null || blocks.length === 0) return h('span', { className: 'dcmp-plain' }, text);
+			const labels = {
+				image: translate('image'),
+				checked: translate('checked'),
+				unchecked: translate('unchecked'),
+			};
+			// A message carrying reference chips is dispatched one text fragment at a
+			// time, so a fragment must stay inline or the chip would be pushed onto a
+			// line of its own. Only real block structure takes over the bubble.
+			if (blocks.length === 1 && blocks[0].type === 'paragraph') {
+				return h('span', { className: 'dcmp-md dcmp-inline' }, renderInline(blocks[0].nodes, labels));
+			}
+			return h('div', { className: 'dcmp-md dcmp-bubble' }, renderBlocks(blocks, labels));
+		}
+		// #endregion
+
+		// #region styles
+		const STYLE_TAG = 'dsh-composer-md-preview/style';
+		const CSS = `
+.dcmp-card{box-sizing:border-box;flex:none;width:calc(100% - var(--dsh-composer-side-clearance,16px) - var(--dsh-composer-side-clearance,16px) - var(--dsh-composer-dock-inset,8px) - var(--dsh-composer-dock-inset,8px) - var(--dsh-composer-dock-inset,8px) - var(--dsh-composer-dock-inset,8px));max-width:calc(var(--dsh-composer-card-max-width,720px) - var(--dsh-composer-dock-inset,8px) - var(--dsh-composer-dock-inset,8px) - var(--dsh-composer-dock-inset,8px) - var(--dsh-composer-dock-inset,8px));margin:0 auto;overflow:hidden;border:0;border-radius:var(--dsw-radius-lg,12px);background:var(--dsw-specific-menu,var(--dsw-alias-bg-layer-1,#fff));backdrop-filter:var(--dsw-menu-backdrop-filter,none);--dsw-elevation-stroke-color:var(--dsw-alias-border-l1,rgb(0 0 0/8%));box-shadow:var(--dsw-elevation-panel,0 4px 16px rgb(0 0 0/8%));color:var(--dsw-alias-label-primary,inherit);--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2,rgb(0 0 0/16%));--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2,rgb(0 0 0/28%));animation:dcmp-grow 160ms cubic-bezier(.2,0,0,1)}
+@keyframes dcmp-grow{from{max-height:0;opacity:0}to{max-height:400px;opacity:1}}
+@media (prefers-reduced-motion:reduce){.dcmp-card{animation:none}}
+.dcmp-head{padding:4px 8px 4px 0}
+.dcmp-headbtn{display:flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;height:28px;margin:0;padding:0 6px 0 12px;border:0;border-radius:var(--dsw-radius-md,8px);background:transparent;color:inherit;font:inherit;font-size:13px;font-weight:400;line-height:20px;text-align:left;cursor:pointer}
+.dcmp-headbtn:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary,#4d6bfe));outline-offset:-2px}
+.dcmp-badge{flex:none;padding:1px 4px;border:.5px solid var(--dsw-alias-border-l2,rgb(0 0 0/18%));border-radius:4px;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary,inherit));font-size:10px;font-weight:600;letter-spacing:.04em;line-height:12px}
+.dcmp-title{flex:none;font-size:13px;font-weight:500;line-height:20px;white-space:nowrap}
+.dcmp-meta{flex:1 1 auto;min-width:0;overflow:hidden;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary,inherit));font-size:13px;line-height:20px;font-variant-numeric:tabular-nums;text-align:right;text-overflow:ellipsis;white-space:nowrap}
+.dcmp-chevron{flex:none;color:var(--dsw-alias-label-tertiary,inherit);transform:rotate(180deg);transition:transform 120ms ease}
+.dcmp-chevron[data-open="true"]{transform:none}
+.dcmp-body{max-height:min(34vh,320px);overflow-y:auto;padding:2px 14px 10px;border-top:.5px solid var(--dsw-alias-border-l1,rgb(0 0 0/8%))}
+.dcmp-body:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary,#4d6bfe));outline-offset:-2px;border-radius:0 0 var(--dsw-radius-lg,12px) var(--dsw-radius-lg,12px)}
+.dcmp-md{min-width:0;overflow-wrap:anywhere;font-size:var(--dsh-content-font-size-secondary,13px);line-height:calc(20px + var(--dsh-content-font-delta-secondary,0px));color:var(--dsw-alias-label-primary,inherit)}
+.dcmp-md>*:first-child{margin-top:0}
+.dcmp-md>*:last-child{margin-bottom:0}
+.dcmp-md p{margin:6px 0}
+.dcmp-plain{white-space:pre-wrap}
+.dcmp-inline{font-size:inherit;line-height:inherit;color:inherit}
+.dcmp-bubble{font-size:inherit;line-height:inherit;color:inherit;white-space:normal;text-align:left}
+.dcmp-bubble.dcmp-md p{margin:0 0 8px}
+.dcmp-bubble.dcmp-md p:last-child{margin-bottom:0}
+.dcmp-bubble.dcmp-md :where(ul,ol){margin:6px 0}
+.dcmp-bubble.dcmp-md .dcmp-heading{margin:10px 0 4px}
+.dcmp-bubble .dcmp-code,.dcmp-bubble .dcmp-quote,.dcmp-bubble .dcmp-tablewrap{margin:6px 0}
+.dcmp-md strong{font-weight:600}
+.dcmp-heading{margin:12px 0 4px;font:inherit;font-weight:600;line-height:1.35}
+h1.dcmp-heading{font-size:1.35em}
+h2.dcmp-heading{font-size:1.2em}
+h3.dcmp-heading{font-size:1.08em}
+.dcmp-md :where(ul,ol){margin:6px 0;padding-left:20px}
+.dcmp-md li>:where(ul,ol){margin-top:2px;margin-bottom:2px}
+.dcmp-item::marker{color:var(--dsw-alias-label-tertiary,inherit)}
+.dcmp-item:not(:first-child){margin-top:2px}
+.dcmp-item>p{margin:0}
+.dcmp-task{list-style:none}
+.dcmp-check{flex:none;width:13px;height:13px;margin:0 7px 0 -20px;vertical-align:-2px;accent-color:var(--dsw-alias-state-business-primary,#4d6bfe);cursor:default;pointer-events:none}
+.dcmp-quote{margin:6px 0;padding-left:10px;border-left:2px solid var(--dsw-alias-border-l2,rgb(0 0 0/18%));color:var(--dsw-alias-label-secondary,inherit)}
+.dcmp-quote>*:first-child{margin-top:0}
+.dcmp-quote>*:last-child{margin-bottom:0}
+.dcmp-rule{height:.5px;margin:10px 0;border:0;background:var(--dsw-alias-border-l2,rgb(0 0 0/18%))}
+.dcmp-inline-code{display:inline;padding:0 4px;border:.5px solid var(--dsw-alias-border-l1,rgb(0 0 0/8%));border-radius:var(--dsw-radius-xs,4px);background:var(--dsw-alias-markdown-inline-code,rgb(0 0 0/5%));font-family:var(--ds-font-family-code,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:.9em;box-decoration-break:clone}
+.dcmp-code{position:relative;margin:8px 0;border:.5px solid var(--dsw-alias-border-l1,rgb(0 0 0/8%));border-radius:var(--dsw-radius-md,8px);background:var(--dsw-alias-markdown-code-block,var(--dsw-alias-bg-layer-2,rgb(0 0 0/3%)));overflow:hidden}
+.dcmp-code-lang{position:absolute;top:4px;right:8px;z-index:1;color:var(--dsw-alias-label-caption,var(--dsw-alias-label-tertiary,inherit));font-family:var(--ds-font-family-code,ui-monospace,monospace);font-size:10px;line-height:14px;letter-spacing:.02em;opacity:.9;pointer-events:none}
+.dcmp-code pre{max-height:264px;margin:0;padding:8px 10px;overflow:auto;font-family:var(--ds-font-family-code,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:.92em;line-height:1.55;tab-size:2}
+.dcmp-code pre code{font:inherit;white-space:pre}
+.dcmp-tablewrap{margin:8px 0;overflow-x:auto}
+.dcmp-table{min-width:100%;border-collapse:collapse;font-size:.96em}
+.dcmp-table th,.dcmp-table td{padding:4px 8px;border:.5px solid var(--dsw-alias-border-l2,rgb(0 0 0/18%));text-align:left;vertical-align:top}
+.dcmp-table th{font-weight:600;background:var(--dsw-alias-bg-layer-2,rgb(0 0 0/3%))}
+.dcmp-link{color:var(--dsw-alias-link,var(--dsw-alias-brand-primary,#4d6bfe));font-weight:500;text-decoration:none;border-bottom:.5px dotted var(--dsw-alias-link,var(--dsw-alias-brand-primary,#4d6bfe))}
+.dcmp-image{display:inline-flex;align-items:center;gap:5px;padding:0 5px;border:.5px dashed var(--dsw-alias-border-l2,rgb(0 0 0/18%));border-radius:var(--dsw-radius-xs,4px);color:var(--dsw-alias-label-secondary,inherit);font-size:.95em}
+.dcmp-image-mark{display:inline-block;width:8px;height:8px;border-radius:2px;background:var(--dsw-alias-label-tertiary,rgb(0 0 0/30%))}
+.dcmp-toggle{display:inline-flex;align-items:center;gap:6px;height:28px;margin:0;padding:0 8px;border:0;border-radius:var(--dsw-radius-sm,6px);background:transparent;color:var(--dsw-alias-label-secondary,inherit);font:inherit;font-size:12px;font-weight:600;letter-spacing:.02em;cursor:pointer;transition:background-color 100ms,color 100ms}
+.dcmp-toggle:hover{background:var(--dsw-alias-interactive-bg-hover,rgb(0 0 0/6%));color:var(--dsw-alias-label-primary,inherit)}
+.dcmp-toggle:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary,#4d6bfe));outline-offset:-2px}
+.dcmp-toggle[aria-pressed="true"]{background:var(--dsw-alias-interactive-bg-hover,rgb(0 0 0/6%));color:var(--dsw-alias-label-primary,inherit)}
+.dcmp-toggle[aria-pressed="false"]{color:var(--dsw-alias-label-tertiary,inherit)}
+.dcmp-toggle-mark{pointer-events:none}
+.dcmp-toggle[aria-pressed="false"] .dcmp-toggle-mark{text-decoration:line-through}
+.dcmp-dot{box-sizing:border-box;width:6px;height:6px;border:1px solid var(--dsw-alias-label-tertiary,rgb(0 0 0/30%));border-radius:50%;background:transparent;transition:background-color 120ms,border-color 120ms}
+.dcmp-dot[data-on="true"]{border-color:var(--dsw-alias-state-business-primary,#4d6bfe);background:var(--dsw-alias-state-business-primary,#4d6bfe)}
+`;
+
+		function installStyles() {
+			const tag = document.createElement('style');
+			tag.dataset.plugin = NS;
+			tag.dataset.pluginCss = STYLE_TAG;
+			tag.textContent = CSS;
+			document.head.appendChild(tag);
+			return tag;
+		}
+		// #endregion
+
+		// #region dictionaries
+		const zh = {
+			title: 'Markdown 预览',
+			meta: '{lines} 行 · {chars} 字符',
+			'meta.overflow': '草稿过长（{chars} 字符），未预览',
+			expand: '展开预览',
+			collapse: '收起预览',
+			image: '图片',
+			checked: '已完成',
+			unchecked: '未完成',
+			'body.label': '渲染后的草稿',
+			'toggle.label': 'Markdown 预览开关',
+			'toggle.on': 'Markdown 预览已开启：草稿出现 Markdown 语法时显示，已发送的消息也按 Markdown 显示',
+			'toggle.off': 'Markdown 预览已关闭：草稿不渲染，已发送的消息按原文显示',
+		};
+		const en = {
+			title: 'Markdown preview',
+			meta: '{lines} lines · {chars} chars',
+			'meta.overflow': 'Draft too long to preview ({chars} chars)',
+			expand: 'Expand preview',
+			collapse: 'Collapse preview',
+			image: 'image',
+			checked: 'done',
+			unchecked: 'not done',
+			'body.label': 'Rendered draft',
+			'toggle.label': 'Markdown preview switch',
+			'toggle.on': 'Markdown preview is on: the draft renders once it contains Markdown, and sent messages render too',
+			'toggle.off': 'Markdown preview is off: no draft card, and sent messages show their raw text',
+		};
+		// #endregion
+
+		// #region plugin
+		/** Required client services. */
+		const inject = ['slots', 'locale'];
+
+		function apply(ctx) {
+			const t = ctx.locale.bind(NS);
+			ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-composer-md-preview: dictionaries');
+			ctx.effect(() => {
+				const tag = installStyles();
+				return () => {
+					tag.remove();
+				};
+			}, 'dsh-composer-md-preview: stylesheet');
+			readPrefs();
+			ctx.slots.inject('conversation.input.dock', () => ctx.slots.register(
+				{ name: 'conversation.input.dock', id: 'composer-md-preview', order: 10, locale: NS },
+				PreviewDock,
+			));
+			ctx.slots.inject('conversation.input.left', () => ctx.slots.register(
+				{ name: 'conversation.input.left', id: 'composer-md-preview-toggle', order: 100, locale: NS },
+				PreviewToggle,
+			));
+			// Shadows the shipped plain-text renderer for the `text` node of a sent
+			// user message. Keyed dispatch renders the LOWEST priority.
+			ctx.slots.inject('conversation.user.text.node', () => ctx.slots.register(
+				{ name: 'conversation.user.text.node', key: 'text', priority: 50, locale: NS },
+				UserMarkdown,
+			));
+			console.info(`[${NS}] ready — ${t('title')}`);
+		}
+		// #endregion
+
+		exports.apply = apply;
+		exports.inject = inject;
+		/** Internal surface for scripts/validate.mjs; not part of the plugin API. */
+		exports.__internals = { looksLikeMarkdown, parseInline, parseBlocks, renderBlocks, PreviewDock, PreviewToggle, UserMarkdown, readPrefs };
+		return module.exports;
+	},
+});

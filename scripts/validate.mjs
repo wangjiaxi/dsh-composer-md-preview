@@ -1,0 +1,637 @@
+/**
+ * Offline validation for `dsh-composer-md-preview`.
+ *
+ * The plugin renders in a browser, which this machine does not have, so this
+ * script checks everything that can be checked without one:
+ *
+ *  1. the manifest, bundle patch, locale files, icon and detail documents;
+ *  2. that `apply` wires the two slot entries and that every UI string the
+ *     components ask for exists in both dictionaries;
+ *  3. the Markdown pipeline itself — detection, block/inline parsing, safe
+ *     links, and hostile-input bounds — by loading `client.js` into a fake
+ *     module-loader environment.
+ *
+ * Run with `node scripts/validate.mjs` (also `npm run validate`).
+ */
+import { readFileSync, existsSync, statSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+let failures = 0;
+let checks = 0;
+
+function check(label, run) {
+	checks += 1;
+	try {
+		const result = run();
+		if (result === false) throw new Error('returned false');
+		console.log(`  ok   ${label}`);
+	} catch (error) {
+		failures += 1;
+		console.error(`  FAIL ${label}\n       ${error instanceof Error ? error.message : String(error)}`);
+	}
+}
+
+function equal(actual, expected, what = 'value') {
+	const a = JSON.stringify(actual);
+	const b = JSON.stringify(expected);
+	if (a !== b) throw new Error(`${what}: expected ${b}, received ${a}`);
+}
+
+// #region manifest
+console.log('\nmanifest');
+const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+
+check('package name and type', () => {
+	if (manifest.name !== 'dsh-composer-md-preview') throw new Error('unexpected name');
+	if (manifest.type !== 'module') throw new Error('type must be module');
+});
+
+check('bundle declares its patch', () => {
+	equal(manifest.dsh?.bundle?.patch, './cordis.patch.yml', 'dsh.bundle.patch');
+	if (!existsSync(join(root, 'cordis.patch.yml'))) throw new Error('patch file missing');
+	const patch = readFileSync(join(root, 'cordis.patch.yml'), 'utf8');
+	if (!patch.includes('composer-md-preview')) throw new Error('patch does not insert the row');
+});
+
+check('client declaration', () => {
+	const client = manifest.dsh?.client;
+	if (client?.platform !== 'web') throw new Error('dsh.client.platform must be web');
+	if (client?.immediately !== true) throw new Error('dsh.client.immediately must be true');
+	for (const name of ['@deepseek-ai/dsh-client-locale', '@deepseek-ai/dsh-client-ui-slots', '@deepseek-ai/dsh-client-ui-conversation']) {
+		if (!client?.inject?.includes(name)) throw new Error(`dsh.client.inject is missing ${name}`);
+	}
+	if (client?.external !== undefined) throw new Error('the bundle must not declare Harness Client externals');
+});
+
+check('runtime exports exist', () => {
+	for (const path of ['./index.js', './client.js', './icon.svg', './locale/en.json', './locale/zh.json']) {
+		if (!existsSync(join(root, path.slice(2)))) throw new Error(`missing ${path}`);
+	}
+});
+
+check('files list covers runtime, docs and icon', () => {
+	const files = manifest.files ?? [];
+	for (const entry of ['index.js', 'client.js', 'cordis.patch.yml', 'locale/*.json', 'docs', 'icon.svg']) {
+		if (!files.includes(entry)) throw new Error(`files is missing ${entry}`);
+	}
+});
+
+check('icon is a small self-contained SVG', () => {
+	const path = join(root, 'icon.svg');
+	if (statSync(path).size > 256 * 1024) throw new Error('icon exceeds 256 KiB');
+	const svg = readFileSync(path, 'utf8');
+	if (!svg.trimStart().startsWith('<svg')) throw new Error('icon is not SVG');
+	for (const banned of ['<script', '<text', '<foreignObject', '<style', '<image']) {
+		if (svg.includes(banned)) throw new Error(`icon contains ${banned}`);
+	}
+	if (!svg.includes('viewBox="0 0 36 36"')) throw new Error('icon should use the 36-unit viewBox');
+});
+
+check('locale metadata and detail documents', () => {
+	for (const locale of ['en', 'zh']) {
+		const dict = JSON.parse(readFileSync(join(root, 'locale', `${locale}.json`), 'utf8'));
+		for (const field of ['title', 'description', 'detail']) {
+			if (typeof dict.meta?.[field] !== 'string' || dict.meta[field].trim() === '') throw new Error(`${locale}.json meta.${field} missing`);
+		}
+		const detail = join(root, dict.meta.detail);
+		if (!existsSync(detail)) throw new Error(`${locale}.json names a missing detail document: ${dict.meta.detail}`);
+		const body = readFileSync(detail, 'utf8').trim();
+		const lines = body.split('\n').filter(line => line.trim() !== '');
+		if (lines.length !== 1 || !/^!\[.+\]\(preview\.svg\)$/.test(lines[0])) throw new Error(`${dict.meta.detail} must hold exactly one image line`);
+	}
+	if (!existsSync(join(root, 'docs', 'preview.svg'))) throw new Error('docs/preview.svg missing');
+});
+// #endregion
+
+// #region load the client bundle
+console.log('\nclient bundle');
+
+const registrations = [];
+const storage = new Map();
+globalThis.window = {
+	__ModuleLoader__: { load: registration => registrations.push(registration) },
+	localStorage: {
+		getItem: key => (storage.has(key) ? storage.get(key) : null),
+		setItem: (key, value) => storage.set(key, String(value)),
+	},
+};
+globalThis.document = {
+	head: { appendChild() {} },
+	createElement: () => ({ dataset: {}, textContent: '', remove() {} }),
+	querySelector: () => null,
+};
+
+const reactStub = {
+	createElement(type, props, ...children) {
+		return { type, props: props ?? {}, children: children.flat(Infinity) };
+	},
+	useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
+	useMemo: factory => factory(),
+	useId: () => 'dcmp-test-id',
+};
+
+const clientSource = readFileSync(join(root, 'client.js'), 'utf8');
+let registered = null;
+let pluginExports = null;
+const dictionaries = [];
+
+check('bundle registers exactly one idempotent factory', () => {
+	// eslint-disable-next-line no-new-func
+	new Function(clientSource)();
+	if (registrations.length !== 1) throw new Error(`expected 1 registration, received ${registrations.length}`);
+	registered = registrations[0];
+	if (registered.id !== 'dsh-composer-md-preview') throw new Error(`unexpected id ${registered.id}`);
+	if (typeof registered.factory !== 'function') throw new Error('factory missing');
+	pluginExports = registered.factory(specifier => {
+		if (specifier === 'react') return reactStub;
+		throw new Error(`unexpected require("${specifier}")`);
+	});
+	if (typeof pluginExports.apply !== 'function') throw new Error('apply missing');
+	equal(pluginExports.inject, ['slots', 'locale'], 'inject');
+});
+
+const internals = pluginExports.__internals;
+check('parser internals exposed for validation', () => {
+	for (const name of ['looksLikeMarkdown', 'parseInline', 'parseBlocks', 'renderBlocks']) {
+		if (typeof internals?.[name] !== 'function') throw new Error(`missing internal ${name}`);
+	}
+});
+
+check('apply registers both slot entries', () => {
+	const injected = [];
+	const ctx = {
+		locale: {
+			bind: () => key => key,
+			register: (_ns, dicts) => {
+				dictionaries.push(dicts);
+				return () => {};
+			},
+		},
+		effect: run => {
+			const dispose = run();
+			return typeof dispose === 'function' ? dispose : () => {};
+		},
+		slots: {
+			inject: (name, install) => {
+				injected.push(name);
+				install();
+				return () => {};
+			},
+			register: (options, component) => {
+				if (typeof component !== 'function') throw new Error(`${options.name} entry is not a component`);
+				injected.push(options.id === undefined
+					? `${options.name}#${options.key}@p${options.priority}`
+					: `${options.name}#${options.id}@${options.order}`);
+				return { options, dispose() {} };
+			},
+		},
+	};
+	pluginExports.apply(ctx);
+	equal(injected, [
+		'conversation.input.dock',
+		'conversation.input.dock#composer-md-preview@10',
+		'conversation.input.left',
+		'conversation.input.left#composer-md-preview-toggle@100',
+		'conversation.user.text.node',
+		'conversation.user.text.node#text@p50',
+	], 'registrations');
+	if (dictionaries.length !== 1) throw new Error('dictionary registration missing');
+});
+
+check('every UI string exists in both dictionaries', () => {
+	const keys = new Set();
+	for (const match of clientSource.matchAll(/(?<![\w$.])(?:translate|t)\(\s*'([a-zA-Z][\w.]*)'/g)) keys.add(match[1]);
+	if (keys.size === 0) throw new Error('no translated keys found in source');
+	const dicts = dictionaries[0];
+	if (dicts === undefined) throw new Error('dictionaries were not registered');
+	for (const key of keys) {
+		for (const locale of ['zh', 'en']) {
+			if (typeof dicts[locale]?.[key] !== 'string') throw new Error(`${locale} dictionary is missing "${key}"`);
+		}
+	}
+	console.log(`       ${keys.size} keys checked: ${[...keys].sort().join(', ')}`);
+});
+// #endregion
+
+// #region parsing
+console.log('\ndetection');
+const { looksLikeMarkdown, parseBlocks, parseInline, renderBlocks } = internals;
+
+check('plain prose is not previewed', () => {
+	for (const text of ['普通一句话，没有任何格式。', 'hello world', '1.5 倍速', 'a - b', '|a|b|', 'C:\\Users\\me', '']) {
+		equal(looksLikeMarkdown(text), false, `looksLikeMarkdown(${JSON.stringify(text)})`);
+	}
+});
+
+check('Markdown constructs are detected', () => {
+	const positives = [
+		'# 标题',
+		'- 一项',
+		'* 一项',
+		'1. 第一',
+		'> 引用',
+		'**粗体**',
+		'__粗体__',
+		'`code`',
+		'~~删除~~',
+		'```js\nconst a = 1\n```',
+		'| a | b |\n|---|---|\n| 1 | 2 |',
+		'[链接](https://example.com)',
+		'![图](https://example.com/a.png)',
+		'---',
+	];
+	for (const text of positives) equal(looksLikeMarkdown(text), true, `looksLikeMarkdown(${JSON.stringify(text)})`);
+});
+
+console.log('\nblocks');
+const types = blocks => blocks.map(block => block.type);
+
+check('headings keep their level', () => {
+	const blocks = parseBlocks('# 一\n## 二\n###### 六');
+	equal(types(blocks), ['heading', 'heading', 'heading'], 'types');
+	equal(blocks.map(block => block.level), [1, 2, 6], 'levels');
+	equal(blocks[0].nodes, [{ type: 'text', value: '一' }], 'text');
+});
+
+check('soft line breaks become breaks, because every Enter was intentional', () => {
+	const blocks = parseBlocks('第一行\n第二行');
+	equal(types(blocks), ['paragraph'], 'types');
+	equal(blocks[0].nodes.map(node => node.type), ['text', 'break', 'text'], 'inline types');
+});
+
+check('bullet list with a nested ordered list', () => {
+	const blocks = parseBlocks('- 一\n  - 一甲\n- 二\n1. 有序\n2. 有序二');
+	equal(types(blocks), ['list', 'list'], 'top-level types');
+	equal(blocks[0].ordered, false, 'first list ordered');
+	equal(blocks[0].items.length, 2, 'first list items');
+	const nested = blocks[0].items[0].blocks.find(block => block.type === 'list');
+	if (nested === undefined) throw new Error('nested list not parsed');
+	equal(nested.ordered, false, 'nested list kind');
+	equal(nested.items.length, 1, 'nested items');
+	equal(blocks[1].ordered, true, 'second list ordered');
+	equal(blocks[1].items.length, 2, 'second list items');
+});
+
+check('ordered list honours its start number', () => {
+	const blocks = parseBlocks('3. 三\n4. 四');
+	equal(blocks[0].start, 3, 'start');
+	equal(blocks[0].items.length, 2, 'items');
+});
+
+check('task list records checked state', () => {
+	const blocks = parseBlocks('- [ ] 未完成\n- [x] 已完成');
+	equal(blocks[0].items.map(item => item.checked), [false, true], 'checked flags');
+});
+
+check('list items absorb fenced code', () => {
+	const blocks = parseBlocks('1. 运行：\n   ```sh\n   ls -la\n   ```');
+	const item = blocks[0].items[0];
+	const code = item.blocks.find(block => block.type === 'code');
+	if (code === undefined) throw new Error(`no code block in item: ${JSON.stringify(item.blocks)}`);
+	equal(code.lang, 'sh', 'lang');
+	equal(code.value, 'ls -la', 'code body');
+});
+
+check('fenced code keeps language and blank lines', () => {
+	const blocks = parseBlocks('```ts\nconst a = 1\n\nconst b = 2\n```');
+	equal(blocks.length, 1, 'one block');
+	equal(blocks[0].lang, 'ts', 'lang');
+	equal(blocks[0].value, 'const a = 1\n\nconst b = 2', 'body');
+});
+
+check('tilde fences and unclosed fences', () => {
+	equal(parseBlocks('~~~js\nx\n~~~')[0].lang, 'js', 'tilde lang');
+	const unclosed = parseBlocks('```js\nx');
+	equal(types(unclosed), ['code'], 'unclosed types');
+	equal(unclosed[0].value, 'x', 'unclosed body');
+});
+
+check('blockquote nests and carries lists', () => {
+	const blocks = parseBlocks('> 引用\n> - 一\n> - 二');
+	equal(types(blocks), ['quote'], 'types');
+	equal(types(blocks[0].blocks), ['paragraph', 'list'], 'quoted block types');
+});
+
+check('table alignment and escapes', () => {
+	const blocks = parseBlocks('| 左 | 中 | 右 |\n|:---|:---:|---:|\n| a | b | c |\n| d \\| e | f | g |');
+	equal(types(blocks), ['table'], 'types');
+	equal(blocks[0].align, ['left', 'center', 'right'], 'align');
+	equal(blocks[0].head.length, 3, 'head cells');
+	equal(blocks[0].rows.length, 2, 'rows');
+	const escaped = renderBlocks(parseBlocks('| a \\| b |\n|---|\n| c |'), { image: 'image' });
+	const text = flatten(escaped);
+	if (!text.includes('a | b')) throw new Error(`escaped pipe lost: ${text}`);
+});
+
+check('thematic break vs heading without text', () => {
+	equal(types(parseBlocks('---')), ['hr'], 'hr');
+	equal(types(parseBlocks('***')), ['hr'], 'asterisk hr');
+	equal(types(parseBlocks('#')), ['heading'], 'bare hash is a heading');
+});
+
+console.log('\ninline');
+check('emphasis, strong, code, strike and links', () => {
+	const nodes = parseInline('普通 **粗** *斜* `码` ~~删~~ [链](https://a.b/c)');
+	equal(nodes.map(node => node.type), ['text', 'strong', 'text', 'em', 'text', 'code', 'text', 'del', 'text', 'link'], 'types');
+	const link = nodes[nodes.length - 1];
+	equal(link.href, 'https://a.b/c', 'href');
+	equal(link.nodes, [{ type: 'text', value: '链' }], 'label');
+});
+
+check('snake_case is not emphasis', () => {
+	const nodes = parseInline('file_name and a_b_c');
+	equal(nodes.every(node => node.type === 'text'), true, `unexpected emphasis: ${JSON.stringify(nodes)}`);
+});
+
+check('backslash escapes are literal', () => {
+	const nodes = parseInline('\\*not emphasis\\* \\`not code\\`');
+	equal(nodes, [{ type: 'text', value: '*not emphasis* `not code`' }], 'nodes');
+});
+
+check('hard-wrapped emphasis does not swallow the next line', () => {
+	const nodes = parseInline('**粗体');
+	equal(nodes, [{ type: 'text', value: '**粗体' }], 'unclosed strong stays literal');
+});
+
+check('emphasis nests inside a longer span', () => {
+	const nodes = parseInline('*a **b** c*');
+	equal(nodes.length, 1, 'top-level nodes');
+	equal(nodes[0].type, 'em', 'outer type');
+	equal(nodes[0].nodes.map(node => node.type), ['text', 'strong', 'text'], 'inner types');
+});
+
+check('a row of pipes alone is not a table', () => {
+	equal(parseBlocks('|a|b|').map(block => block.type), ['paragraph'], 'blocks');
+	equal(parseBlocks('| a | b |\n|---|---|').map(block => block.type), ['table'], 'real table');
+});
+
+check('images become labelled placeholders', () => {
+	const nodes = parseInline('![示意图](https://a.b/x.png)');
+	equal(nodes[0].type, 'image', 'type');
+	equal(nodes[0].alt, '示意图', 'alt');
+});
+
+console.log('\nsafety');
+function flatten(value) {
+	if (value === null || value === undefined || value === false) return '';
+	if (typeof value === 'string') return value;
+	if (Array.isArray(value)) return value.map(flatten).join('');
+	if (typeof value === 'object') return flatten(value.children);
+	return '';
+}
+
+function collect(value, predicate, found = []) {
+	if (value === null || value === undefined || typeof value === 'string') return found;
+	if (Array.isArray(value)) {
+		for (const item of value) collect(item, predicate, found);
+		return found;
+	}
+	if (typeof value === 'object') {
+		if (predicate(value)) found.push(value);
+		collect(value.children, predicate, found);
+	}
+	return found;
+}
+
+check('dangerous link protocols never become anchors', () => {
+	for (const href of ['javascript:alert(1)', 'vbscript:x', 'file:///etc/passwd', 'data:text/html,x']) {
+		const tree = renderBlocks(parseBlocks(`[click](${href})`), { image: 'image' });
+		const anchors = collect(tree, node => node.type === 'a');
+		equal(anchors.length, 0, `anchors for ${href}`);
+		if (!flatten(tree).includes('click')) throw new Error(`label lost for ${href}`);
+	}
+});
+
+check('safe links do become anchors', () => {
+	const tree = renderBlocks(parseBlocks('[ok](https://example.com/a)'), { image: 'image' });
+	const anchors = collect(tree, node => node.type === 'a');
+	equal(anchors.length, 1, 'anchors');
+	equal(anchors[0].props.href, 'https://example.com/a', 'href');
+	equal(anchors[0].props.rel, 'noreferrer noopener', 'rel');
+});
+
+check('raw HTML never becomes markup', () => {
+	const tree = renderBlocks(parseBlocks('<script>alert(1)</script>\n\n<b>粗</b>'), { image: 'image' });
+	equal(collect(tree, node => node.type === 'script').length, 0, 'script elements');
+	equal(collect(tree, node => node.type === 'b').length, 0, 'b elements');
+	if (!flatten(tree).includes('<script>alert(1)</script>')) throw new Error('raw HTML should stay literal text');
+});
+
+check('images are never loaded', () => {
+	const tree = renderBlocks(parseBlocks('![x](https://evil.example/track.png)'), { image: 'image' });
+	equal(collect(tree, node => node.type === 'img').length, 0, 'img elements');
+});
+
+console.log('\nrobustness');
+check('empty and whitespace drafts parse to nothing', () => {
+	equal(parseBlocks(''), [], 'empty');
+	equal(parseBlocks('\n\n\n'), [], 'blank lines');
+	equal(parseBlocks('   '), [], 'spaces');
+});
+
+check('deep nesting stops at the depth cap instead of overflowing', () => {
+	const quoted = `${'> '.repeat(400)}深`;
+	const blocks = parseBlocks(quoted);
+	equal(blocks[0].type, 'quote', 'quote');
+	let depth = 0;
+	let cursor = blocks[0];
+	while (cursor !== undefined && cursor.type === 'quote') {
+		depth += 1;
+		cursor = cursor.blocks[0];
+	}
+	if (depth > 8) throw new Error(`blockquote depth ${depth} exceeds the cap`);
+	const nestedList = Array.from({ length: 400 }, (_, index) => `${'  '.repeat(index)}- x`).join('\n');
+	parseBlocks(nestedList);
+});
+
+check('a hostile draft stays fast', () => {
+	const hostile = `${'`'.repeat(2000)}\n${'*a* '.repeat(4000)}\n${'- [ ] x\n'.repeat(1000)}`;
+	const started = performance.now();
+	parseBlocks(hostile);
+	parseBlocks(`${'['.repeat(5000)}`);
+	parseBlocks(`${'**'.repeat(3000)}`);
+	const elapsed = performance.now() - started;
+	if (elapsed > 2000) throw new Error(`parsing took ${elapsed.toFixed(0)}ms`);
+	console.log(`       hostile draft parsed in ${elapsed.toFixed(1)}ms`);
+});
+
+check('rendering tolerates every block kind', () => {
+	const block = [
+		'# 标题',
+		'段落 **粗** 与 `码`。',
+		'> 引用',
+		'- [x] 任务',
+		'- 项目\n  1. 嵌套',
+		'| a | b |\n|---|---|\n| 1 | 2 |',
+		'---',
+		'```js\nconst a = 1\n```',
+		'![图](https://a.b/x.png)',
+	].join('\n\n');
+	const tree = renderBlocks(parseBlocks(block), { image: 'image' });
+	const text = flatten(tree);
+	for (const expected of ['标题', '粗', '码', '引用', '任务', '嵌套', 'const a = 1', '图']) {
+		if (!text.includes(expected)) throw new Error(`rendered text is missing ${expected}: ${text}`);
+	}
+});
+
+console.log('\ncomponents');
+/**
+ * Execute the dock component directly with a controllable input hook. This
+ * runs the real component body — hooks included — so a crash there is caught
+ * here instead of in the browser, where it would blank the slot entry.
+ */
+function renderDock(draft) {
+	const props = {
+		useInput: selector => selector({ draft }),
+		t: key => key,
+		useSession: selector => selector({}),
+		session: {},
+		input: { draft },
+	};
+	return internals.PreviewDock(props);
+}
+
+check('component stays hidden for empty and plain-prose drafts', () => {
+	equal(renderDock(''), null, 'empty draft');
+	equal(renderDock('   \n '), null, 'blank draft');
+	equal(renderDock('明天下午三点开会，记得带电脑。'), null, 'prose draft');
+});
+
+check('component renders a card for a Markdown draft', () => {
+	const card = renderDock('## 明天\n\n- 看完 `docs`\n- 跑一次 **测试**');
+	if (card === null || card.type !== 'section') throw new Error('card not rendered');
+	equal(card.props.className, 'dcmp-card', 'card class');
+	const text = flatten(card);
+	for (const expected of ['明天', '看完', 'docs', '跑一次', '测试']) {
+		if (!text.includes(expected)) throw new Error(`card text is missing ${expected}: ${text}`);
+	}
+	if (!collect(card, node => node.type === 'h2').length) throw new Error('heading not rendered');
+	if (!collect(card, node => node.type === 'ul').length) throw new Error('list not rendered');
+	if (!collect(card, node => node.type === 'strong').length) throw new Error('strong not rendered');
+});
+
+check('component header collapses and expands the body', () => {
+	const card = renderDock('- 一\n- 二');
+	const head = card.children[0];
+	const headButton = head.children[0];
+	if (typeof headButton.props.onClick !== 'function') throw new Error('header is not a button');
+	equal(headButton.props['aria-expanded'], true, 'expanded by default');
+	headButton.props.onClick();
+	const collapsed = renderDock('- 一\n- 二');
+	if (collapsed === null) throw new Error('collapsed card disappeared');
+	if (collect(collapsed, node => node.type === 'ul').length) throw new Error('body still rendered while collapsed');
+	if (!flatten(collapsed).includes('title')) throw new Error('header text lost while collapsed');
+	collapsed.children[0].children[0].props.onClick();
+	const reopened = renderDock('- 一\n- 二');
+	if (!collect(reopened, node => node.type === 'ul').length) throw new Error('body did not come back');
+});
+
+check('the MD pill turns the whole feature off and on', () => {
+	if (renderDock('# 标题') === null) throw new Error('card should start visible');
+	const pill = internals.PreviewToggle({ t: key => key });
+	if (pill === null || pill.type !== 'button') throw new Error('MD pill not rendered');
+	equal(pill.props['aria-pressed'], true, 'pill starts pressed');
+	pill.props.onClick();
+	equal(renderDock('# 标题'), null, 'card after disabling');
+	equal(internals.PreviewToggle({ t: key => key }).props['aria-pressed'], false, 'pill reports off');
+	equal(internals.UserMarkdown({ node: { id: 'text', data: { text: '- 一' } }, raw: '- 一', t: key => key }).type, 'span', 'sent messages fall back');
+	internals.PreviewToggle({ t: key => key }).props.onClick();
+	if (renderDock('# 标题') === null) throw new Error('preview did not come back from the pill');
+	const persisted = storage.get('dsh-composer-md-preview/v1');
+	if (typeof persisted !== 'string' || !persisted.includes('"enabled":true')) throw new Error(`preference not persisted: ${persisted}`);
+});
+
+check('component respects a disabled preference', () => {
+	storage.set('dsh-composer-md-preview/v1', JSON.stringify({ enabled: false, collapsed: false }));
+	internals.readPrefs();
+	equal(renderDock('# 标题'), null, 'disabled card');
+	storage.set('dsh-composer-md-preview/v1', JSON.stringify({ enabled: true, collapsed: false }));
+	internals.readPrefs();
+	const card = renderDock('# 标题');
+	if (card === null) throw new Error('preview did not return after re-reading preferences');
+});
+
+check('component shows only a notice for oversized Markdown drafts', () => {
+	const huge = `# 标题\n\n${'文字'.repeat(30000)}`;
+	const card = renderDock(huge);
+	if (card === null) throw new Error('oversized Markdown draft should still show its header');
+	const text = flatten(card);
+	if (!text.includes('meta.overflow')) throw new Error(`notice missing: ${text.slice(0, 120)}`);
+	const bodies = collect(card, node => node.props?.className === 'dcmp-body');
+	equal(bodies.length, 0, 'rendered bodies');
+});
+
+check('component stays hidden for oversized plain prose', () => {
+	equal(renderDock('文字'.repeat(30000)), null, 'prose overflow');
+});
+
+console.log('\nsent messages');
+/** Execute the sent-message renderer as the keyed `text` entry does. */
+function renderUser(text, overrides = {}) {
+	return internals.UserMarkdown({
+		node: { id: 'text', data: { text } },
+		raw: text,
+		t: key => key,
+		...overrides,
+	});
+}
+
+check('a sent message renders Markdown inside its bubble', () => {
+	const tree = renderUser('## 结论\n\n- 一\n- **二**');
+	if (tree === null || tree.type !== 'div') throw new Error('not rendered as a block');
+	if (!tree.props.className.includes('dcmp-bubble')) throw new Error('bubble class missing');
+	const text = flatten(tree);
+	for (const expected of ['结论', '一', '二']) {
+		if (!text.includes(expected)) throw new Error(`missing ${expected}: ${text}`);
+	}
+	if (!collect(tree, node => node.type === 'h2').length) throw new Error('heading not rendered');
+	if (!collect(tree, node => node.type === 'ul').length) throw new Error('list not rendered');
+	if (!collect(tree, node => node.type === 'strong').length) throw new Error('strong not rendered');
+});
+
+check('a sent message without Markdown keeps the shipped plain run', () => {
+	const tree = renderUser('明天下午三点开会，记得带电脑。');
+	equal(tree.type, 'span', 'element');
+	if (!tree.props.className.includes('dcmp-plain')) throw new Error('plain run class missing');
+	equal(flatten(tree), '明天下午三点开会，记得带电脑。', 'text');
+});
+
+check('a sent message falls back to plain text instead of failing', () => {
+	equal(flatten(renderUser('')), '', 'empty message');
+	const withoutNode = renderUser('**粗**', { node: null });
+	equal(withoutNode.type, 'span', 'node data is optional');
+	equal(flatten(renderUser('# 标题\n\n正文')).includes('标题'), true, 'markdown still renders');
+	equal(renderUser('文字'.repeat(30000)).type, 'span', 'oversized plain text');
+	equal(renderUser(`# t\n${'文字'.repeat(30000)}`).type, 'span', 'oversized Markdown');
+	equal(collect(renderUser('<script>alert(1)</script>'), node => node.type === 'script').length, 0, 'no script element');
+});
+
+check('a single-paragraph message stays inline so reference chips keep their flow', () => {
+	const inline = renderUser('先看 **这份** 再决定');
+	equal(inline.type, 'span', 'root element');
+	if (!inline.props.className.includes('dcmp-inline')) throw new Error('inline class missing');
+	const styled = renderUser('**粗** 与 `码`');
+	equal(styled.type, 'span', 'formatted paragraph root');
+	if (!collect(styled, node => node.type === 'strong').length) throw new Error('strong lost');
+	equal(renderUser('- 一\n- 二').type, 'div', 'a list takes over the bubble');
+	equal(renderUser('## 标题').type, 'div', 'a heading takes over the bubble');
+	equal(renderUser('```js\nconst a = 1\n```').type, 'div', 'a fence takes over the bubble');
+});
+
+check('a sent message follows the preview switch', () => {
+	storage.set('dsh-composer-md-preview/v1', JSON.stringify({ enabled: false, collapsed: false }));
+	internals.readPrefs();
+	equal(renderUser('- 一').type, 'span', 'disabled renders raw text');
+	storage.set('dsh-composer-md-preview/v1', JSON.stringify({ enabled: true, collapsed: false }));
+	internals.readPrefs();
+	equal(renderUser('- 一').type, 'div', 'enabled renders Markdown');
+});
+// #endregion
+
+console.log(`\n${checks - failures}/${checks} checks passed`);
+if (failures > 0) {
+	console.error(`${failures} check(s) failed`);
+	process.exit(1);
+}

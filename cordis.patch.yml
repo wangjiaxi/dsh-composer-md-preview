@@ -1,0 +1,8 @@
+# dsh-composer-md-preview bundle patch.
+#
+# One row: the Host half is an empty plugin. The whole feature lives in the
+# Client module (client.js), which registers two slot entries; the row exists
+# so the Loader has something to mount and the Web graph has a package to serve.
+- insert:
+    - id: composer-md-preview
+      name: dsh-composer-md-preview
