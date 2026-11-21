@@ -4,21 +4,7 @@ Markdown rendering for your own messages in DeepSeek Harness: a live preview
 card above the composer while you type, and the same rendering for the messages
 you have already sent.
 
-```
-┌────────────────────────────────────────────┐
-│ [MD] Markdown 预览        6 行 · 182 字符 ▾ │
-├────────────────────────────────────────────┤
-│ ## 明天要做的事                             │
-│ • 看完 文档                                  │
-│ • 跑一次 bash 命令                          │
-│   ┌──────────────────────────────────────┐ │
-│   │ bash                                 │ │
-│   │ dsh plugin --profile web list        │ │
-│   └──────────────────────────────────────┘ │
-│ > 引用的话                                  │
-└────────────────────────────────────────────┘
-┌─ 输入框（仍是原始草稿，可正常编辑）──────────┐
-```
+![A sent message rendered as Markdown above the live draft preview card, with the raw draft still editable in the composer card below](docs/preview.svg)
 
 ## Install
 
