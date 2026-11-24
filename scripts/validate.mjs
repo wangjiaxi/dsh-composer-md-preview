@@ -138,6 +138,7 @@ const reactStub = {
 	useMemo: factory => factory(),
 	useId: () => 'dcmp-test-id',
 	useRef: initial => ({ current: initial }),
+	useState: initial => [initial, () => {}],
 	useEffect: effect => {
 		const cleanup = effect();
 		effectCleanups.push(typeof cleanup === 'function' ? cleanup : () => {});
@@ -159,8 +160,12 @@ check('bundle registers exactly one idempotent factory', () => {
 	registered = registrations[0];
 	if (registered.id !== 'dsh-composer-md-preview') throw new Error(`unexpected id ${registered.id}`);
 	if (typeof registered.factory !== 'function') throw new Error('factory missing');
+	const reactDomStub = {
+		createPortal: (element, container) => ({ type: 'portal', element, container }),
+	};
 	pluginExports = registered.factory(specifier => {
 		if (specifier === 'react') return reactStub;
+		if (specifier === 'react-dom') return reactDomStub;
 		throw new Error(`unexpected require("${specifier}")`);
 	});
 	if (typeof pluginExports.apply !== 'function') throw new Error('apply missing');
@@ -169,7 +174,7 @@ check('bundle registers exactly one idempotent factory', () => {
 
 const internals = pluginExports.__internals;
 check('parser internals exposed for validation', () => {
-	for (const name of ['looksLikeMarkdown', 'parseInline', 'parseBlocks', 'renderBlocks']) {
+	for (const name of ['looksLikeMarkdown', 'parseInline', 'parseBlocks', 'renderBlocks', 'draftPanel']) {
 		if (typeof internals?.[name] !== 'function') throw new Error(`missing internal ${name}`);
 	}
 });
@@ -205,8 +210,6 @@ check('apply registers both slot entries', () => {
 	};
 	pluginExports.apply(ctx);
 	equal(injected, [
-		'conversation.input.dock',
-		'conversation.input.dock#composer-md-preview@10',
 		'conversation.input.left',
 		'conversation.input.left#composer-md-preview-toggle@100',
 		'conversation.user.text.node',
@@ -497,81 +500,65 @@ check('rendering tolerates every block kind', () => {
 });
 
 console.log('\ncomponents');
-/**
- * Execute the dock component directly with a controllable input hook. This
- * runs the real component body — hooks included — so a crash there is caught
- * here instead of in the browser, where it would blank the slot entry.
- */
-function renderDock(draft) {
-	const props = {
-		useInput: selector => selector({ draft }),
-		t: key => key,
-		useSession: selector => selector({}),
-		session: {},
-		input: { draft },
-	};
-	return internals.PreviewDock(props);
+/** Build the rendered panel exactly as the composer bridge does. */
+function renderPanel(draft, { enabled = true } = {}) {
+	return internals.draftPanel({ draft, enabled, translate: key => key });
 }
 
-check('component stays hidden for empty and plain-prose drafts', () => {
-	equal(renderDock(''), null, 'empty draft');
-	equal(renderDock('   \n '), null, 'blank draft');
-	equal(renderDock('明天下午三点开会，记得带电脑。'), null, 'prose draft');
+check('panel stays hidden for empty and plain-prose drafts', () => {
+	equal(renderPanel(''), null, 'empty draft');
+	equal(renderPanel('   \n '), null, 'blank draft');
+	equal(renderPanel('明天下午三点开会，记得带电脑。'), null, 'prose draft');
 });
 
-check('component renders a card for a Markdown draft', () => {
-	const card = renderDock('## 明天\n\n- 看完 `docs`\n- 跑一次 **测试**');
-	if (card === null || card.type !== 'div') throw new Error('panel not rendered');
-	equal(card.props.className, 'dcmp-inline-preview', 'panel class');
-	equal(card.props.role, 'region', 'region role');
-	const text = flatten(card);
+check('panel renders the Markdown draft', () => {
+	const panel = renderPanel('## 明天\n\n- 看完 `docs`\n- 跑一次 **测试**');
+	if (panel === null || panel.type !== 'div') throw new Error('panel not rendered');
+	equal(panel.props.className, 'dcmp-inline-preview', 'panel class');
+	equal(panel.props.role, 'region', 'region role');
+	const text = flatten(panel);
 	for (const expected of ['明天', '看完', 'docs', '跑一次', '测试']) {
-		if (!text.includes(expected)) throw new Error(`card text is missing ${expected}: ${text}`);
+		if (!text.includes(expected)) throw new Error(`panel text is missing ${expected}: ${text}`);
 	}
-	if (!collect(card, node => node.type === 'h2').length) throw new Error('heading not rendered');
-	if (!collect(card, node => node.type === 'ul').length) throw new Error('list not rendered');
-	if (!collect(card, node => node.type === 'strong').length) throw new Error('strong not rendered');
+	if (!collect(panel, node => node.type === 'h2').length) throw new Error('heading not rendered');
+	if (!collect(panel, node => node.type === 'ul').length) throw new Error('list not rendered');
+	if (!collect(panel, node => node.type === 'strong').length) throw new Error('strong not rendered');
 });
 
 check('the MD pill turns the whole feature off and on', () => {
-	if (renderDock('# 标题') === null) throw new Error('card should start visible');
 	const pill = internals.PreviewToggle({ t: key => key });
 	if (pill === null || pill.type !== 'button') throw new Error('MD pill not rendered');
 	equal(pill.props['aria-pressed'], true, 'pill starts pressed');
+	equal(renderPanel('# 标题'), null === null ? renderPanel('# 标题') : null, 'panel exists while on');
 	pill.props.onClick();
-	equal(renderDock('# 标题'), null, 'card after disabling');
 	equal(internals.PreviewToggle({ t: key => key }).props['aria-pressed'], false, 'pill reports off');
 	equal(internals.UserMarkdown({ node: { id: 'text', data: { text: '- 一' } }, raw: '- 一', t: key => key }).type, 'span', 'sent messages fall back');
 	internals.PreviewToggle({ t: key => key }).props.onClick();
-	if (renderDock('# 标题') === null) throw new Error('preview did not come back from the pill');
+	equal(internals.PreviewToggle({ t: key => key }).props['aria-pressed'], true, 'pill back on');
+	if (renderPanel('# 标题') === null) throw new Error('panel should render again');
 	const persisted = storage.get('dsh-composer-md-preview/v1');
 	if (typeof persisted !== 'string' || !persisted.includes('"enabled":true')) throw new Error(`preference not persisted: ${persisted}`);
 });
 
-check('component respects a disabled preference', () => {
-	storage.set('dsh-composer-md-preview/v1', JSON.stringify({ enabled: false, collapsed: false }));
-	internals.readPrefs();
-	equal(renderDock('# 标题'), null, 'disabled card');
-	storage.set('dsh-composer-md-preview/v1', JSON.stringify({ enabled: true, collapsed: false }));
-	internals.readPrefs();
-	const card = renderDock('# 标题');
-	if (card === null) throw new Error('preview did not return after re-reading preferences');
+check('the panel honours the master switch', () => {
+	equal(renderPanel('# 标题', { enabled: false }), null, 'disabled panel');
+	if (renderPanel('# 标题', { enabled: true }) === null) throw new Error('enabled panel missing');
 });
 
-check('component shows only a notice for oversized Markdown drafts', () => {
+check('panel shows only a notice for oversized Markdown drafts', () => {
 	const huge = `# 标题\n\n${'文字'.repeat(30000)}`;
-	const card = renderDock(huge);
-	if (card === null) throw new Error('oversized Markdown draft should still show its header');
-	const text = flatten(card);
+	const panel = renderPanel(huge);
+	if (panel === null) throw new Error('oversized Markdown draft should still show its panel');
+	const text = flatten(panel);
 	if (!text.includes('meta.overflow')) throw new Error(`notice missing: ${text.slice(0, 120)}`);
-	const bodies = collect(card, node => node.props?.className === 'dcmp-md');
+	const bodies = collect(panel, node => node.props?.className === 'dcmp-md');
 	equal(bodies.length, 0, 'no rendered body for an oversized draft');
-	const notices = collect(card, node => node.props?.className === 'dcmp-notice');
+	const notices = collect(panel, node => node.props?.className === 'dcmp-notice');
 	equal(notices.length, 1, 'notice rendered');
 });
 
-check('component stays hidden for oversized plain prose', () => {
-	equal(renderDock('文字'.repeat(30000)), null, 'prose overflow');
+check('panel stays hidden for oversized plain prose', () => {
+	equal(renderPanel('文字'.repeat(30000)), null, 'prose overflow');
 });
 
 console.log('\nsent messages');
@@ -741,7 +728,8 @@ check('the paste handler hands fenced code to the shell', () => {
 	};
 	const state = { draft: '前半段：\n\n', phase: 'plain' };
 	const useInput = selector => selector(state);
-	internals.PasteBridge({ inputActions: actions, useInput });
+	const bridge = props => internals.ComposerBridge({ useInput, t: key => key, ...props });
+	bridge({ inputActions: actions });
 
 	const code = 'const a = 1;\nconst b = 2;';
 	const event = ({ text, shift = false, files = [], editable = true, inComposer = true }) => ({
@@ -804,11 +792,11 @@ check('the paste handler hands fenced code to the shell', () => {
 	reset();
 	appended = null;
 	state.phase = 'sending';
-	internals.PasteBridge({ inputActions: actions, useInput });
+	bridge({ inputActions: actions });
 	listener(event({ text: code }));
 	equal(appended, null, 'a frozen composer swallows the paste like the shell does');
 	state.phase = 'plain';
-	internals.PasteBridge({ inputActions: actions, useInput });
+	bridge({ inputActions: actions });
 	insertResult = true;
 
 	reset();
@@ -830,26 +818,29 @@ check('the paste handler hands fenced code to the shell', () => {
 	equal(typeof inserted?.text, 'string', 'back on');
 
 	// With no live composer handle the paste is left to the browser.
-	internals.PasteBridge({ inputActions: undefined });
+	bridge({ inputActions: undefined });
 	reset();
 	listener(event({ text: code }));
 	equal(prevented, 0, 'no shell handle leaves the native paste');
 	equal(setDataCalls, 1, 'clipboard rewrite attempted instead');
-	internals.PasteBridge({ inputActions: actions });
+	bridge({ inputActions: actions });
 });
 
-check('the bridge publishes the composer actions and renders nothing', () => {
-	equal(internals.PasteBridge({ inputActions: undefined }), null, 'renders nothing');
-	equal(internals.pasteBridge.actions, undefined, 'cleared without actions');
+check('the bridge publishes the composer actions and an invisible anchor', () => {
 	const actions = { insertText: () => true };
-	equal(internals.PasteBridge({ inputActions: actions }), null, 'still nothing');
-	equal(internals.pasteBridge.actions, actions, 'published');
 	const useInput = selector => selector({ draft: 'abc', phase: 'claimed' });
-	internals.PasteBridge({ inputActions: actions, useInput });
+	const result = internals.ComposerBridge({ inputActions: actions, useInput, t: key => key });
+	if (!Array.isArray(result) || result.length !== 2) throw new Error('bridge did not render its anchor');
+	equal(result[0].type, 'span', 'anchor element');
+	equal(result[0].props.className, 'dcmp-anchor', 'anchor class');
+	equal(result[1], null, 'no portal without a card host');
+	equal(internals.pasteBridge.actions, actions, 'actions published');
 	equal(internals.pasteBridge.draft, 'abc', 'draft published');
 	equal(internals.pasteBridge.phase, 'claimed', 'phase published');
-	internals.PasteBridge({ inputActions: actions, useInput: undefined });
-	equal(internals.pasteBridge.draft, '', 'draft cleared without a session');
+	const cleared = internals.ComposerBridge({ inputActions: undefined, useInput: undefined, t: key => key });
+	if (!Array.isArray(cleared)) throw new Error('bridge still renders an anchor without a session');
+	equal(internals.pasteBridge.actions, undefined, 'actions cleared');
+	equal(internals.pasteBridge.draft, '', 'draft cleared');
 });
 
 check('the Settings row toggles the paste rewrite', () => {

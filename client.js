@@ -5,10 +5,10 @@
  * Three slot entries, one idea: your own text reads as Markdown, not as
  * markers.
  *
- *  - `conversation.input.dock` (`composer-md-preview`, order 10) — a card
- *    docked directly above the composer card that renders the live draft as
- *    Markdown. It reads the draft through the slot's `useInput` standard hook,
- *    so it repaints on every edit without subscribing to the session itself.
+ *  - `conversation.input.left` (`composer-md-preview-bridge`, order 101) — the
+ *    seat inside the composer card: it renders nothing, portals the rendered
+ *    draft into the card so the input box itself shows it, and publishes the
+ *    session's action face for the document-level paste listener.
  *  - `conversation.input.left` (`composer-md-preview-toggle`, order 100) — the
  *    MD pill in the composer tool row: the master switch for both halves.
  *  - `conversation.user.text.node` (`key: 'text'`, priority 50) — renders a sent
@@ -32,6 +32,7 @@ window.__ModuleLoader__.load({
 		var exports = module.exports;
 
 		const React = require('react');
+		const ReactDOM = require('react-dom');
 		const h = React.createElement;
 
 		/** Locale namespace owned by this plugin. */
@@ -746,25 +747,53 @@ window.__ModuleLoader__.load({
 		/**
 		 * Live composer handle for the document-level paste listener.
 		 *
-		 * The listener runs outside React, so it cannot read a prop. `PasteBridge`
-		 * publishes the session's stable action face here on every render.
+		 * The listener runs outside React, so it cannot read a prop. The composer
+		 * bridge publishes the session's stable action face here on every render.
 		 */
 		const pasteBridge = { actions: undefined, draft: '', phase: 'plain' };
 
 		/**
-		 * Publish the composer's action face for the paste listener.
+		 * The one seat inside the composer card a plugin can take.
 		 *
-		 * Renders nothing: the composer's tool row keeps its layout, the listener
-		 * gets a handle that outlives a re-render.
-		 * @param props - slot props: the session's input actions.
-		 * @returns nothing.
+		 * It does three things from there: publish the session's action face for the
+		 * document-level paste listener, portal the rendered draft into a container
+		 * appended to the card (ordered first, so it becomes the top of the input
+		 * box itself rather than a panel outside it), and keep that container alive
+		 * across re-renders.
+		 * @param props - slot props: input actions, the input hook, locale seat.
 		 */
-		function PasteBridge({ inputActions, useInput }) {
-			pasteBridge.actions = inputActions !== null && typeof inputActions === 'object' ? inputActions : undefined;
+		function ComposerBridge({ inputActions, useInput, t }) {
+			const translate = typeof t === 'function' ? t : key => key;
+			const prefsNow = usePrefs();
+			const anchorRef = React.useRef(null);
+			const [host, setHost] = React.useState(null);
 			const state = typeof useInput === 'function' ? useInput(snapshot => snapshot) : undefined;
-			pasteBridge.draft = typeof state?.draft === 'string' ? state.draft : '';
+			const draft = typeof state?.draft === 'string' ? state.draft : '';
+			pasteBridge.actions = inputActions !== null && typeof inputActions === 'object' ? inputActions : undefined;
+			pasteBridge.draft = draft;
 			pasteBridge.phase = typeof state?.phase === 'string' ? state.phase : 'plain';
-			return null;
+
+			React.useEffect(() => {
+				const anchor = anchorRef.current;
+				const card = anchor === null || anchor === undefined ? null : anchor.closest('[data-composer-card]');
+				if (card === null) return undefined;
+				const container = document.createElement('div');
+				container.className = 'dcmp-host';
+				card.appendChild(container);
+				setHost(container);
+				return () => {
+					container.remove();
+				};
+			}, []);
+
+			const panel = React.useMemo(
+				() => draftPanel({ draft, enabled: prefsNow.enabled, translate }),
+				[draft, prefsNow.enabled, translate],
+			);
+			return [
+				h('span', { key: 'anchor', ref: anchorRef, className: 'dcmp-anchor', 'aria-hidden': 'true' }),
+				host === null || panel === null ? null : ReactDOM.createPortal(panel, host),
+			];
 		}
 
 		/** A paste that already carries a fence is left alone. */
@@ -972,56 +1001,34 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * The rendered draft, fused to the top of the composer card.
+		 * Build the rendered draft panel, or null when there is nothing to show.
 		 *
-		 * It reuses the card's width, surface and radius and squares the card's top
-		 * corners while attached, so the two surfaces read as one rounded box with
-		 * the editing line below — not as a second panel. The editable layer and
-		 * the caret stay the shell's; this renders what that layer holds.
-		 * @param props - slot props: `useInput` standard hook, `t` locale seat.
+		 * Pure: the panel is portalled into the composer card, and this function
+		 * only decides whether it exists and what it contains.
+		 * @param input - the draft, the master switch, and the translate seat.
+		 * @returns the panel element, or null.
 		 */
-		function PreviewDock({ useInput, t }) {
-			const translate = typeof t === 'function' ? t : key => key;
-			const prefsNow = usePrefs();
-			const panelRef = React.useRef(null);
-			const draft = (typeof useInput === 'function' ? useInput : useNoInput)(selectDraft);
-			// Detection scans the whole draft; the parse only runs for what is drawn.
+		function draftPanel({ draft, enabled, translate }) {
+			const say = typeof translate === 'function' ? translate : key => key;
 			const overflow = draft.length > MAX_RENDER_CHARS;
 			const text = overflow ? draft.slice(0, MAX_RENDER_CHARS) : draft;
-			const visible = prefsNow.enabled && text.trim() !== '' && looksLikeMarkdown(draft);
-			const blocks = React.useMemo(() => (visible && !overflow ? parseBlocks(text) : null), [visible, overflow, text]);
-
-			// The joint lives in CSS, which cannot select a card from its previous
-			// sibling: mark the card itself and undo it when the panel goes away.
-			React.useEffect(() => {
-				if (!visible) return undefined;
-				const panel = panelRef.current;
-				const card = panel === null || panel === undefined ? null : panel.closest('[data-composer-card]');
-				if (card === null) return undefined;
-				card.setAttribute('data-dcmp-fused', '');
-				return () => {
-					card.removeAttribute('data-dcmp-fused');
-				};
-			}, [visible]);
-
-			if (!visible) return null;
+			if (!enabled || text.trim() === '' || !looksLikeMarkdown(draft)) return null;
 			const labels = {
-				image: translate('image'),
-				checked: translate('checked'),
-				unchecked: translate('unchecked'),
+				image: say('image'),
+				checked: say('checked'),
+				unchecked: say('unchecked'),
 			};
 			return h(
 				'div',
 				{
-					ref: panelRef,
 					className: 'dcmp-inline-preview',
 					'data-dsh-md-preview': '',
 					role: 'region',
-					'aria-label': translate('title'),
+					'aria-label': say('title'),
 				},
 				overflow
-					? h('p', { className: 'dcmp-notice' }, translate('meta.overflow', { chars: draft.length }))
-					: h('div', { className: 'dcmp-md' }, renderBlocks(blocks ?? [], labels)),
+					? h('p', { className: 'dcmp-notice' }, say('meta.overflow', { chars: draft.length }))
+					: h('div', { className: 'dcmp-md' }, renderBlocks(parseBlocks(text), labels)),
 			);
 		}
 
@@ -1129,12 +1136,15 @@ window.__ModuleLoader__.load({
 		// #region styles
 		const STYLE_TAG = 'dsh-composer-md-preview/style';
 		const CSS = `
-.dcmp-inline-preview{position:relative;z-index:1;box-sizing:border-box;flex:none;width:calc(100% - var(--dsh-composer-side-clearance,16px) - var(--dsh-composer-side-clearance,16px));max-width:var(--dsh-composer-card-max-width,720px);margin:0 auto calc(0px - var(--dsh-composer-stack-gap,6px) - 8px);padding:12px 14px 14px;max-height:min(40vh,320px);overflow:hidden auto;border-radius:var(--dsw-radius-panel,24px) var(--dsw-radius-panel,24px) 0 0;background:var(--dsw-specific-input-major,#fff);color:var(--dsw-alias-label-primary,inherit);--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2,rgb(0 0 0/16%));--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2,rgb(0 0 0/28%));animation:dcmp-grow 160ms cubic-bezier(.2,0,0,1)}
-@keyframes dcmp-grow{from{max-height:0;opacity:0}to{max-height:320px;opacity:1}}
+.dcmp-anchor{display:none}
+.dcmp-host{order:-1;display:block;flex:none;min-width:0}
+.dcmp-host:empty{display:none}
+.dcmp-inline-preview{box-sizing:border-box;min-width:0;max-height:min(40vh,320px);overflow:hidden auto;padding:4px 14px 0;font-size:var(--dsh-content-font-size,14px);line-height:calc(24px + var(--dsh-content-font-delta,0px));color:var(--dsw-alias-label-primary,inherit);cursor:text;--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2,rgb(0 0 0/16%));--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2,rgb(0 0 0/28%));animation:dcmp-fade 160ms ease-out}
+@keyframes dcmp-fade{from{opacity:0}to{opacity:1}}
 @media (prefers-reduced-motion:reduce){.dcmp-inline-preview{animation:none}}
-[data-composer-card][data-dcmp-fused]{border-radius:0 0 var(--dsw-radius-panel,24px) var(--dsw-radius-panel,24px)}
+.dcmp-inline-preview a{pointer-events:none}
 .dcmp-notice{margin:0;color:var(--dsw-alias-label-tertiary,inherit);font-size:var(--dsh-content-font-size-secondary,13px);line-height:20px}
-.dcmp-inline-preview .dcmp-md{font-size:var(--dsh-content-font-size,14px);line-height:calc(24px + var(--dsh-content-font-delta,0px))}
+.dcmp-inline-preview .dcmp-md{font-size:inherit;line-height:inherit}
 .dcmp-md{min-width:0;overflow-wrap:anywhere;font-size:var(--dsh-content-font-size-secondary,13px);line-height:calc(20px + var(--dsh-content-font-delta-secondary,0px));color:var(--dsw-alias-label-primary,inherit)}
 .dcmp-md>*:first-child{margin-top:0}
 .dcmp-md>*:last-child{margin-bottom:0}
@@ -1246,10 +1256,6 @@ h3.dcmp-heading{font-size:1.08em}
 				};
 			}, 'dsh-composer-md-preview: stylesheet');
 			readPrefs();
-			ctx.slots.inject('conversation.input.dock', () => ctx.slots.register(
-				{ name: 'conversation.input.dock', id: 'composer-md-preview', order: 10, locale: NS },
-				PreviewDock,
-			));
 			ctx.slots.inject('conversation.input.left', () => ctx.slots.register(
 				{ name: 'conversation.input.left', id: 'composer-md-preview-toggle', order: 100, locale: NS },
 				PreviewToggle,
@@ -1263,7 +1269,7 @@ h3.dcmp-heading{font-size:1.08em}
 			ctx.effect(() => installPasteFence(), 'dsh-composer-md-preview: code paste');
 			ctx.slots.inject('conversation.input.left', () => ctx.slots.register(
 				{ name: 'conversation.input.left', id: 'composer-md-preview-bridge', order: 101, locale: NS },
-				PasteBridge,
+				ComposerBridge,
 			));
 			ctx.slots.inject('settings.general.item', () => ctx.slots.register(
 				{ name: 'settings.general.item', id: 'composer-md-preview-autofence', order: 30, locale: NS },
@@ -1278,8 +1284,8 @@ h3.dcmp-heading{font-size:1.08em}
 		/** Internal surface for scripts/validate.mjs; not part of the plugin API. */
 		exports.__internals = {
 			looksLikeMarkdown, parseInline, parseBlocks, renderBlocks,
-			PreviewDock, PreviewToggle, UserMarkdown, AutoFenceRow, readPrefs,
-			looksLikeCode, detectLanguage, fenceForPaste, pasteWithBreaks, PasteBridge, pasteBridge,
+			draftPanel, PreviewToggle, UserMarkdown, AutoFenceRow, readPrefs,
+			looksLikeCode, detectLanguage, fenceForPaste, pasteWithBreaks, ComposerBridge, pasteBridge,
 		};
 		return module.exports;
 	},
