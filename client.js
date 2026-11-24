@@ -886,6 +886,7 @@ window.__ModuleLoader__.load({
 
 		/** Install the paste rewrite; returns its disposer. */
 		function installPasteFence() {
+			let refusalReported = false;
 			const onPaste = event => {
 				if (!prefsSnapshot.enabled || !prefsSnapshot.autoFence) return;
 				// An explicit "paste as plain text" gesture asks for the text as is.
@@ -898,12 +899,20 @@ window.__ModuleLoader__.load({
 				if (data.files !== null && data.files !== undefined && data.files.length > 0) return;
 				const fenced = fenceForPaste(data.getData('text/plain'));
 				if (fenced === null) return;
+				const rewritten = pasteWithBreaks(fenced, caretAtLineStart(true));
 				try {
 					// A read-only clipboard surface would throw here; the browser's own
 					// paste then proceeds with the untouched text.
-					data.setData('text/plain', pasteWithBreaks(fenced, caretAtLineStart(true)));
+					data.setData('text/plain', rewritten);
 				} catch (error) {
 					console.warn('[composer-md-preview] could not rewrite the pasted text', error);
+					return;
+				}
+				// Read the value back once: a platform that silently ignores the write
+				// would otherwise look like a classification bug.
+				if (!refusalReported && data.getData('text/plain') !== rewritten) {
+					refusalReported = true;
+					console.warn('[composer-md-preview] this browser refuses to rewrite a pasted text; the paste is left as is');
 				}
 			};
 			document.addEventListener('paste', onPaste, true);

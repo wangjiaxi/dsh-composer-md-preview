@@ -725,15 +725,22 @@ check('the paste handler rewrites only a composer code paste', () => {
 	const listener = pasteListeners[0];
 	if (listener === undefined) throw new Error('paste listener missing');
 	let rewritten = null;
-	const event = ({ text, shift = false, files = [], editable = true, inComposer = true }) => ({
-		shiftKey: shift,
-		target: new FakeElement({ editable, inComposer }),
-		clipboardData: {
-			files,
-			getData: () => text,
-			setData: (type, value) => { if (type === 'text/plain') rewritten = value; },
-		},
-	});
+	const event = ({ text, shift = false, files = [], editable = true, inComposer = true, writable = true }) => {
+		const state = { text };
+		return {
+			shiftKey: shift,
+			target: new FakeElement({ editable, inComposer }),
+			clipboardData: {
+				files,
+				getData: () => state.text,
+				setData: (type, value) => {
+					if (type !== 'text/plain') return;
+					rewritten = value;
+					if (writable) state.text = value;
+				},
+			},
+		};
+	};
 	const reset = () => { rewritten = null; };
 	const code = 'const a = 1;\nconst b = 2;';
 
@@ -776,6 +783,11 @@ check('the paste handler rewrites only a composer code paste', () => {
 	internals.readPrefs();
 	listener(event({ text: code }));
 	equal(typeof rewritten, 'string', 'back on');
+
+	// A clipboard that silently ignores the write must not throw or loop.
+	reset();
+	listener(event({ text: code, writable: false }));
+	equal(typeof rewritten, 'string', 'a refusing clipboard still attempts the write');
 });
 
 check('the Settings row toggles the paste rewrite', () => {
