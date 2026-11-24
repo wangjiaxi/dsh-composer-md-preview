@@ -143,6 +143,10 @@ const reactStub = {
 		const cleanup = effect();
 		effectCleanups.push(typeof cleanup === 'function' ? cleanup : () => {});
 	},
+	useLayoutEffect: effect => {
+		const cleanup = effect();
+		effectCleanups.push(typeof cleanup === 'function' ? cleanup : () => {});
+	},
 };
 
 /** Cleanups collected from the stub's useEffect, mirroring unmount. */

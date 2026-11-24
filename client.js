@@ -767,7 +767,7 @@ window.__ModuleLoader__.load({
 			const prefsNow = usePrefs();
 			const anchorRef = React.useRef(null);
 			const [host, setHost] = React.useState(null);
-			const [focused, setFocused] = React.useState(false);
+			const [focused, setFocused] = React.useState(true);
 			const state = typeof useInput === 'function' ? useInput(snapshot => snapshot) : undefined;
 			const draft = typeof state?.draft === 'string' ? state.draft : '';
 			pasteBridge.actions = inputActions !== null && typeof inputActions === 'object' ? inputActions : undefined;
@@ -821,7 +821,9 @@ window.__ModuleLoader__.load({
 				[focused, host, draft, prefsNow.enabled, translate],
 			);
 			const reading = panel !== null;
-			React.useEffect(() => {
+			// Layout effect: the editing line collapses in the same frame the panel
+			// mounts, so the card never paints an empty middle.
+			React.useLayoutEffect(() => {
 				const anchor = anchorRef.current;
 				const card = anchor === null || anchor === undefined ? null : anchor.closest('[data-composer-card]');
 				if (card === null) return undefined;
