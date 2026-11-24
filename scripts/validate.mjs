@@ -220,6 +220,8 @@ check('apply registers both slot entries', () => {
 		'conversation.user.text.node#text@p50',
 		'conversation.input.left',
 		'conversation.input.left#composer-md-preview-bridge@101',
+		'conversation.input.left',
+		'conversation.input.left#composer-md-preview-build-0.6.1@102',
 		'settings.general.item',
 		'settings.general.item#composer-md-preview-autofence@30',
 	], 'registrations');

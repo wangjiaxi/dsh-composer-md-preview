@@ -37,6 +37,8 @@ window.__ModuleLoader__.load({
 
 		/** Locale namespace owned by this plugin. */
 		const NS = 'dsh-composer-md-preview';
+		/** Build identity, registered by an invisible entry so a live page can be told apart. */
+		const VERSION = '0.6.1';
 		/** localStorage key holding the two persisted preferences. */
 		const STORAGE_KEY = 'dsh-composer-md-preview/v1';
 		/** Quiet time before a focused composer swaps its source for the rendering. */
@@ -865,6 +867,15 @@ window.__ModuleLoader__.load({
 			];
 		}
 
+		/**
+		 * Invisible build marker: the entry id carries `VERSION`, so a running page
+		 * reports which build it loaded through slot inspection.
+		 * @returns nothing.
+		 */
+		function VersionMarker() {
+			return null;
+		}
+
 		/** A paste that already carries a fence is left alone. */
 		const FENCED = /^ {0,3}(`{3,}|~{3,})/m;
 		/** Pastes above this size skip classification entirely. */
@@ -1342,6 +1353,10 @@ h3.dcmp-heading{font-size:1.08em}
 				{ name: 'conversation.input.left', id: 'composer-md-preview-bridge', order: 101, locale: NS },
 				ComposerBridge,
 			));
+			ctx.slots.inject('conversation.input.left', () => ctx.slots.register(
+				{ name: 'conversation.input.left', id: `composer-md-preview-build-${VERSION}`, order: 102 },
+				VersionMarker,
+			));
 			ctx.slots.inject('settings.general.item', () => ctx.slots.register(
 				{ name: 'settings.general.item', id: 'composer-md-preview-autofence', order: 30, locale: NS },
 				AutoFenceRow,
@@ -1355,7 +1370,7 @@ h3.dcmp-heading{font-size:1.08em}
 		/** Internal surface for scripts/validate.mjs; not part of the plugin API. */
 		exports.__internals = {
 			looksLikeMarkdown, parseInline, parseBlocks, renderBlocks,
-			draftPanel, PreviewToggle, UserMarkdown, AutoFenceRow, readPrefs,
+			VERSION, draftPanel, PreviewToggle, UserMarkdown, AutoFenceRow, readPrefs,
 			looksLikeCode, detectLanguage, fenceForPaste, pasteWithBreaks, ComposerBridge, pasteBridge,
 		};
 		return module.exports;
