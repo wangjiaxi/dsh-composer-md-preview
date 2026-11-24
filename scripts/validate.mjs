@@ -731,6 +731,7 @@ check('the paste handler hands fenced code to the shell', () => {
 	let inserted = null;
 	let captured = null;
 	let prevented = 0;
+	let stopped = 0;
 	let setDataCalls = 0;
 	let insertResult = true;
 	const actions = {
@@ -743,13 +744,16 @@ check('the paste handler hands fenced code to the shell', () => {
 			return insertResult;
 		},
 	};
-	internals.PasteBridge({ inputActions: actions });
+	const state = { draft: '前半段：\n\n', phase: 'plain' };
+	const useInput = selector => selector(state);
+	internals.PasteBridge({ inputActions: actions, useInput });
 
 	const code = 'const a = 1;\nconst b = 2;';
 	const event = ({ text, shift = false, files = [], editable = true, inComposer = true }) => ({
 		shiftKey: shift,
 		target: new FakeElement({ editable, inComposer }),
 		preventDefault: () => { prevented += 1; },
+		stopImmediatePropagation: () => { stopped += 1; },
 		clipboardData: {
 			files,
 			getData: () => text,
@@ -760,12 +764,14 @@ check('the paste handler hands fenced code to the shell', () => {
 		inserted = null;
 		captured = null;
 		prevented = 0;
+		stopped = 0;
 		setDataCalls = 0;
 	};
 
 	reset();
 	listener(event({ text: code }));
 	equal(prevented, 1, 'default paste prevented');
+	equal(stopped, 1, 'the composer paste command never sees the event');
 	equal(inserted?.text, '```javascript\nconst a = 1;\nconst b = 2;\n```\n', 'inserted payload');
 	equal(inserted?.span, captured, 'the caret is captured before inserting');
 	equal(setDataCalls, 0, 'clipboard left alone when the shell can insert');
@@ -791,10 +797,23 @@ check('the paste handler hands fenced code to the shell', () => {
 	listener(event({ text: '一段普通的文字\n还有第二行' }));
 	equal(inserted, null, 'prose');
 
+	let appended = null;
+	actions.setDraft = text => { appended = text; };
 	reset();
+	appended = null;
 	insertResult = false;
 	listener(event({ text: code }));
 	equal(prevented, 1, 'a refusing shell still consumed the default paste');
+	equal(appended, `前半段：\n\n${'```javascript\nconst a = 1;\nconst b = 2;\n```\n'}`, 'an unmapped span appends instead of dropping the paste');
+
+	reset();
+	appended = null;
+	state.phase = 'sending';
+	internals.PasteBridge({ inputActions: actions, useInput });
+	listener(event({ text: code }));
+	equal(appended, null, 'a frozen composer swallows the paste like the shell does');
+	state.phase = 'plain';
+	internals.PasteBridge({ inputActions: actions, useInput });
 	insertResult = true;
 
 	reset();
@@ -830,6 +849,12 @@ check('the bridge publishes the composer actions and renders nothing', () => {
 	const actions = { insertText: () => true };
 	equal(internals.PasteBridge({ inputActions: actions }), null, 'still nothing');
 	equal(internals.pasteBridge.actions, actions, 'published');
+	const useInput = selector => selector({ draft: 'abc', phase: 'claimed' });
+	internals.PasteBridge({ inputActions: actions, useInput });
+	equal(internals.pasteBridge.draft, 'abc', 'draft published');
+	equal(internals.pasteBridge.phase, 'claimed', 'phase published');
+	internals.PasteBridge({ inputActions: actions, useInput: undefined });
+	equal(internals.pasteBridge.draft, '', 'draft cleared without a session');
 });
 
 check('the Settings row toggles the paste rewrite', () => {

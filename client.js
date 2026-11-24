@@ -751,7 +751,7 @@ window.__ModuleLoader__.load({
 		 * The listener runs outside React, so it cannot read a prop. `PasteBridge`
 		 * publishes the session's stable action face here on every render.
 		 */
-		const pasteBridge = { actions: undefined };
+		const pasteBridge = { actions: undefined, draft: '', phase: 'plain' };
 
 		/**
 		 * Publish the composer's action face for the paste listener.
@@ -761,8 +761,11 @@ window.__ModuleLoader__.load({
 		 * @param props - slot props: the session's input actions.
 		 * @returns nothing.
 		 */
-		function PasteBridge({ inputActions }) {
+		function PasteBridge({ inputActions, useInput }) {
 			pasteBridge.actions = inputActions !== null && typeof inputActions === 'object' ? inputActions : undefined;
+			const state = typeof useInput === 'function' ? useInput(snapshot => snapshot) : undefined;
+			pasteBridge.draft = typeof state?.draft === 'string' ? state.draft : '';
+			pasteBridge.phase = typeof state?.phase === 'string' ? state.phase : 'plain';
 			return null;
 		}
 
@@ -938,8 +941,20 @@ window.__ModuleLoader__.load({
 				// and refuses exactly when the editor would have refused the paste.
 				const span = actions.captureInsertion();
 				event.preventDefault();
+				// The composer's own paste command reads the clipboard and inserts the
+				// raw text without looking at `defaultPrevented`, so the event must not
+				// reach it: only this handler's insert may land.
+				event.stopImmediatePropagation();
 				if (actions.insertText(payload, span) !== true) {
-					// Frozen or disposed composer: it would have dropped the paste too.
+					// False means a frozen composer (which would have dropped the paste
+					// too) or a span that no longer maps. Never lose the text on the
+					// second case; the caret moves to the end, and nothing is written
+					// while the composer is frozen.
+					const phase = pasteBridge.phase;
+					if ((phase === 'plain' || phase === 'claimed') && typeof actions.setDraft === 'function') {
+						actions.setDraft(pasteBridge.draft + payload);
+						console.warn('[composer-md-preview] inserted the code block at the end of the draft');
+					}
 					return;
 				}
 			};
