@@ -24,9 +24,12 @@ Requires DSH `0.2.2-rc.3` or newer within the `0.2.x` line.
 
 Two halves of one idea — your Markdown reads as Markdown, not as markers.
 
-1. **Draft preview.** A card docked directly above the input box renders the
-   draft as you type. It appears only when the draft actually contains Markdown
-   syntax, so plain prose is never duplicated above the input box.
+1. **Draft preview, in the input box.** The composer card itself grows an upper
+   section that renders the draft as you type — same width, same surface, same
+   rounded box, no second panel and no chrome of its own. The rendered text sits
+   above your editing line, so one box holds both. It appears only when the
+   draft actually contains Markdown syntax, so plain prose leaves the input box
+   exactly as the shell drew it.
 2. **Sent messages.** A message you send renders as Markdown in the
    conversation, in the same bubble as before, using the same renderer as the
    draft card. Assistant messages were always rendered; now your own messages
@@ -72,7 +75,7 @@ before:  function f() { return 1 }        after:  ```javascript
 
 | Registration | Slot | What it is |
 | --- | --- | --- |
-| `conversation.input.dock` | `id: composer-md-preview`, order 10 | the preview card, docked beside the Todo and queue cards |
+| `conversation.input.dock` | `id: composer-md-preview`, order 10 | the rendered upper section, fused to the composer card (it squares the card's top corners while attached) |
 | `conversation.input.left` | `id: composer-md-preview-toggle`, order 100 | the `MD` pill in the composer tool row |
 | `conversation.user.text.node` | `key: text`, priority 50 | Markdown rendering for the text of a sent message, shadowing the shipped plain-text run (keyed dispatch renders the lowest priority) |
 | `settings.general.item` | `id: composer-md-preview-autofence`, order 30 | the **Fence pasted code** switch in Settings → General |
@@ -122,8 +125,10 @@ or reference-style links, and reference-style definitions render literally.
 
 安装：`dsh plugin --profile web add github:wangjiaxi/dsh-composer-md-preview`，刷新一次页面——插件页显示「Markdown 预览」，输入框工具行出现 `MD`。要求 DSH `0.2.2-rc.3` 及以上（0.2.x 线）。
 
-- **草稿预览**：输入框正上方一张卡片实时渲染草稿；只有草稿里出现 Markdown
-  语法时才会出现，普通文字不会在输入框上方重复一遍。
+- **草稿预览（就在输入框里）**：输入框卡片自己往上长出一截渲染区，和输入卡片
+  同宽、同底色、同一个圆角盒子——没有第二块面板，也没有标题栏；渲染结果在上、
+  你正在编辑的那一行在下，同一个盒子里。只有草稿出现 Markdown 语法时才长出来，
+  普通文字仍是原来那个输入框。
 - **已发送消息**：发送出去的消息在对话里也按 Markdown 渲染（和助手消息一样），
   位置和气泡样式不变。
 - **粘贴代码自动加代码块**：把一段代码粘进输入框，会自动包成围栏代码块并尽量标上

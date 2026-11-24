@@ -45,12 +45,11 @@ window.__ModuleLoader__.load({
 		/**
 		 * Persisted preferences, shared by both slot entries.
 		 *
-		 * `enabled` is the master switch (the MD pill writes it). `collapsed` is the
-		 * card's own disclosure state; it survives a remount so switching sessions
-		 * does not reopen a card the user folded. `autoFence` wraps a pasted code
-		 * chunk in a fenced block; its own row lives in Settings > General.
+		 * `enabled` is the master switch (the MD pill writes it). `autoFence` wraps
+		 * a pasted code chunk in a fenced block; its own row lives in Settings >
+		 * General.
 		 */
-		let prefs = { enabled: true, collapsed: false, autoFence: true };
+		let prefs = { enabled: true, autoFence: true };
 		let prefsSnapshot = prefs;
 		const prefsListeners = new Set();
 
@@ -61,7 +60,6 @@ window.__ModuleLoader__.load({
 				const parsed = JSON.parse(raw);
 				if (parsed === null || typeof parsed !== 'object') return;
 				if (typeof parsed.enabled === 'boolean') prefs.enabled = parsed.enabled;
-				if (typeof parsed.collapsed === 'boolean') prefs.collapsed = parsed.collapsed;
 				if (typeof parsed.autoFence === 'boolean') prefs.autoFence = parsed.autoFence;
 				prefsSnapshot = { ...prefs };
 			} catch (error) {
@@ -964,22 +962,6 @@ window.__ModuleLoader__.load({
 		// #endregion
 
 		// #region components
-		/** Icon: a chevron, drawn inline so the plugin needs no icon package. */
-		function Chevron({ open }) {
-			return h(
-				'svg',
-				{ className: 'dcmp-chevron', viewBox: '0 0 12 12', width: 12, height: 12, 'aria-hidden': 'true', 'data-open': open ? 'true' : 'false' },
-				h('path', {
-					d: 'M3 4.75 6 7.75l3-3',
-					fill: 'none',
-					stroke: 'currentColor',
-					strokeWidth: 1.5,
-					strokeLinecap: 'round',
-					strokeLinejoin: 'round',
-				}),
-			);
-		}
-
 		/** Fallback hook keeps the render hook order stable when no input seat exists. */
 		function useNoInput() {
 			return '';
@@ -990,63 +972,56 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * The docked preview card.
-		 * @param props - slot props: `useInput` standard hook, `t` locale seat, and
-		 * the `conversation.input.dock` owner zone (unused, read through the hook).
+		 * The rendered draft, fused to the top of the composer card.
+		 *
+		 * It reuses the card's width, surface and radius and squares the card's top
+		 * corners while attached, so the two surfaces read as one rounded box with
+		 * the editing line below — not as a second panel. The editable layer and
+		 * the caret stay the shell's; this renders what that layer holds.
+		 * @param props - slot props: `useInput` standard hook, `t` locale seat.
 		 */
 		function PreviewDock({ useInput, t }) {
 			const translate = typeof t === 'function' ? t : key => key;
 			const prefsNow = usePrefs();
-			const bodyId = React.useId();
+			const panelRef = React.useRef(null);
 			const draft = (typeof useInput === 'function' ? useInput : useNoInput)(selectDraft);
-			// Detection reads the whole draft (a cheap scan); the parse below only
-			// runs for the part that is actually rendered.
+			// Detection scans the whole draft; the parse only runs for what is drawn.
 			const overflow = draft.length > MAX_RENDER_CHARS;
 			const text = overflow ? draft.slice(0, MAX_RENDER_CHARS) : draft;
 			const visible = prefsNow.enabled && text.trim() !== '' && looksLikeMarkdown(draft);
-			const showBody = visible && !prefsNow.collapsed && !overflow;
-			const blocks = React.useMemo(() => (showBody ? parseBlocks(text) : null), [showBody, text]);
-			if (!visible) return null;
+			const blocks = React.useMemo(() => (visible && !overflow ? parseBlocks(text) : null), [visible, overflow, text]);
 
+			// The joint lives in CSS, which cannot select a card from its previous
+			// sibling: mark the card itself and undo it when the panel goes away.
+			React.useEffect(() => {
+				if (!visible) return undefined;
+				const panel = panelRef.current;
+				const card = panel === null || panel === undefined ? null : panel.closest('[data-composer-card]');
+				if (card === null) return undefined;
+				card.setAttribute('data-dcmp-fused', '');
+				return () => {
+					card.removeAttribute('data-dcmp-fused');
+				};
+			}, [visible]);
+
+			if (!visible) return null;
 			const labels = {
 				image: translate('image'),
 				checked: translate('checked'),
 				unchecked: translate('unchecked'),
 			};
-			const meta = overflow
-				? translate('meta.overflow', { chars: draft.length })
-				: translate('meta', { lines: text.split('\n').length, chars: text.length });
-
 			return h(
-				'section',
-				{ className: 'dcmp-card', 'data-dsh-md-preview': '', 'aria-label': translate('title') },
-				h(
-					'div',
-					{ className: 'dcmp-head' },
-					h(
-						'button',
-						{
-							type: 'button',
-							className: 'dcmp-headbtn',
-							'aria-expanded': !prefsNow.collapsed,
-							'aria-controls': overflow ? undefined : bodyId,
-							title: prefsNow.collapsed ? translate('expand') : translate('collapse'),
-							onMouseDown: event => event.preventDefault(),
-							onClick: () => commitPrefs({ collapsed: !prefsNow.collapsed }),
-						},
-						h('span', { className: 'dcmp-badge', 'aria-hidden': 'true' }, 'MD'),
-						h('span', { className: 'dcmp-title' }, translate('title')),
-						h('span', { className: 'dcmp-meta' }, meta),
-						h(Chevron, { open: !prefsNow.collapsed }),
-					),
-				),
-				showBody && blocks !== null
-					? h(
-						'div',
-						{ className: 'dcmp-body', id: bodyId, role: 'region', tabIndex: 0, 'aria-label': translate('body.label') },
-						h('div', { className: 'dcmp-md' }, renderBlocks(blocks, labels)),
-					)
-					: null,
+				'div',
+				{
+					ref: panelRef,
+					className: 'dcmp-inline-preview',
+					'data-dsh-md-preview': '',
+					role: 'region',
+					'aria-label': translate('title'),
+				},
+				overflow
+					? h('p', { className: 'dcmp-notice' }, translate('meta.overflow', { chars: draft.length }))
+					: h('div', { className: 'dcmp-md' }, renderBlocks(blocks ?? [], labels)),
 			);
 		}
 
@@ -1154,19 +1129,12 @@ window.__ModuleLoader__.load({
 		// #region styles
 		const STYLE_TAG = 'dsh-composer-md-preview/style';
 		const CSS = `
-.dcmp-card{box-sizing:border-box;flex:none;width:calc(100% - var(--dsh-composer-side-clearance,16px) - var(--dsh-composer-side-clearance,16px) - var(--dsh-composer-dock-inset,8px) - var(--dsh-composer-dock-inset,8px) - var(--dsh-composer-dock-inset,8px) - var(--dsh-composer-dock-inset,8px));max-width:calc(var(--dsh-composer-card-max-width,720px) - var(--dsh-composer-dock-inset,8px) - var(--dsh-composer-dock-inset,8px) - var(--dsh-composer-dock-inset,8px) - var(--dsh-composer-dock-inset,8px));margin:0 auto;overflow:hidden;border:0;border-radius:var(--dsw-radius-lg,12px);background:var(--dsw-specific-menu,var(--dsw-alias-bg-layer-1,#fff));backdrop-filter:var(--dsw-menu-backdrop-filter,none);--dsw-elevation-stroke-color:var(--dsw-alias-border-l1,rgb(0 0 0/8%));box-shadow:var(--dsw-elevation-panel,0 4px 16px rgb(0 0 0/8%));color:var(--dsw-alias-label-primary,inherit);--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2,rgb(0 0 0/16%));--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2,rgb(0 0 0/28%));animation:dcmp-grow 160ms cubic-bezier(.2,0,0,1)}
-@keyframes dcmp-grow{from{max-height:0;opacity:0}to{max-height:400px;opacity:1}}
-@media (prefers-reduced-motion:reduce){.dcmp-card{animation:none}}
-.dcmp-head{padding:4px 8px 4px 0}
-.dcmp-headbtn{display:flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;height:28px;margin:0;padding:0 6px 0 12px;border:0;border-radius:var(--dsw-radius-md,8px);background:transparent;color:inherit;font:inherit;font-size:13px;font-weight:400;line-height:20px;text-align:left;cursor:pointer}
-.dcmp-headbtn:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary,#4d6bfe));outline-offset:-2px}
-.dcmp-badge{flex:none;padding:1px 4px;border:.5px solid var(--dsw-alias-border-l2,rgb(0 0 0/18%));border-radius:4px;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary,inherit));font-size:10px;font-weight:600;letter-spacing:.04em;line-height:12px}
-.dcmp-title{flex:none;font-size:13px;font-weight:500;line-height:20px;white-space:nowrap}
-.dcmp-meta{flex:1 1 auto;min-width:0;overflow:hidden;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary,inherit));font-size:13px;line-height:20px;font-variant-numeric:tabular-nums;text-align:right;text-overflow:ellipsis;white-space:nowrap}
-.dcmp-chevron{flex:none;color:var(--dsw-alias-label-tertiary,inherit);transform:rotate(180deg);transition:transform 120ms ease}
-.dcmp-chevron[data-open="true"]{transform:none}
-.dcmp-body{max-height:min(34vh,320px);overflow-y:auto;padding:2px 14px 10px;border-top:.5px solid var(--dsw-alias-border-l1,rgb(0 0 0/8%))}
-.dcmp-body:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary,#4d6bfe));outline-offset:-2px;border-radius:0 0 var(--dsw-radius-lg,12px) var(--dsw-radius-lg,12px)}
+.dcmp-inline-preview{position:relative;z-index:1;box-sizing:border-box;flex:none;width:calc(100% - var(--dsh-composer-side-clearance,16px) - var(--dsh-composer-side-clearance,16px));max-width:var(--dsh-composer-card-max-width,720px);margin:0 auto calc(0px - var(--dsh-composer-stack-gap,6px) - 8px);padding:12px 14px 14px;max-height:min(40vh,320px);overflow:hidden auto;border-radius:var(--dsw-radius-panel,24px) var(--dsw-radius-panel,24px) 0 0;background:var(--dsw-specific-input-major,#fff);color:var(--dsw-alias-label-primary,inherit);--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2,rgb(0 0 0/16%));--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2,rgb(0 0 0/28%));animation:dcmp-grow 160ms cubic-bezier(.2,0,0,1)}
+@keyframes dcmp-grow{from{max-height:0;opacity:0}to{max-height:320px;opacity:1}}
+@media (prefers-reduced-motion:reduce){.dcmp-inline-preview{animation:none}}
+[data-composer-card][data-dcmp-fused]{border-radius:0 0 var(--dsw-radius-panel,24px) var(--dsw-radius-panel,24px)}
+.dcmp-notice{margin:0;color:var(--dsw-alias-label-tertiary,inherit);font-size:var(--dsh-content-font-size-secondary,13px);line-height:20px}
+.dcmp-inline-preview .dcmp-md{font-size:var(--dsh-content-font-size,14px);line-height:calc(24px + var(--dsh-content-font-delta,0px))}
 .dcmp-md{min-width:0;overflow-wrap:anywhere;font-size:var(--dsh-content-font-size-secondary,13px);line-height:calc(20px + var(--dsh-content-font-delta-secondary,0px));color:var(--dsw-alias-label-primary,inherit)}
 .dcmp-md>*:first-child{margin-top:0}
 .dcmp-md>*:last-child{margin-bottom:0}
@@ -1240,14 +1208,10 @@ h3.dcmp-heading{font-size:1.08em}
 		// #region dictionaries
 		const zh = {
 			title: 'Markdown 预览',
-			meta: '{lines} 行 · {chars} 字符',
 			'meta.overflow': '草稿过长（{chars} 字符），未预览',
-			expand: '展开预览',
-			collapse: '收起预览',
 			image: '图片',
 			checked: '已完成',
 			unchecked: '未完成',
-			'body.label': '渲染后的草稿',
 			'toggle.label': 'Markdown 预览开关',
 			'toggle.on': 'Markdown 预览已开启：草稿出现 Markdown 语法时显示，已发送的消息也按 Markdown 显示',
 			'toggle.off': 'Markdown 预览已关闭：草稿不渲染，已发送的消息按原文显示',
@@ -1256,14 +1220,10 @@ h3.dcmp-heading{font-size:1.08em}
 		};
 		const en = {
 			title: 'Markdown preview',
-			meta: '{lines} lines · {chars} chars',
 			'meta.overflow': 'Draft too long to preview ({chars} chars)',
-			expand: 'Expand preview',
-			collapse: 'Collapse preview',
 			image: 'image',
 			checked: 'done',
 			unchecked: 'not done',
-			'body.label': 'Rendered draft',
 			'toggle.label': 'Markdown preview switch',
 			'toggle.on': 'Markdown preview is on: the draft renders once it contains Markdown, and sent messages render too',
 			'toggle.off': 'Markdown preview is off: no draft card, and sent messages show their raw text',

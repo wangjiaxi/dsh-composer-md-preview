@@ -137,7 +137,15 @@ const reactStub = {
 	useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
 	useMemo: factory => factory(),
 	useId: () => 'dcmp-test-id',
+	useRef: initial => ({ current: initial }),
+	useEffect: effect => {
+		const cleanup = effect();
+		effectCleanups.push(typeof cleanup === 'function' ? cleanup : () => {});
+	},
 };
+
+/** Cleanups collected from the stub's useEffect, mirroring unmount. */
+const effectCleanups = [];
 
 const clientSource = readFileSync(join(root, 'client.js'), 'utf8');
 let registered = null;
@@ -513,8 +521,9 @@ check('component stays hidden for empty and plain-prose drafts', () => {
 
 check('component renders a card for a Markdown draft', () => {
 	const card = renderDock('## 明天\n\n- 看完 `docs`\n- 跑一次 **测试**');
-	if (card === null || card.type !== 'section') throw new Error('card not rendered');
-	equal(card.props.className, 'dcmp-card', 'card class');
+	if (card === null || card.type !== 'div') throw new Error('panel not rendered');
+	equal(card.props.className, 'dcmp-inline-preview', 'panel class');
+	equal(card.props.role, 'region', 'region role');
 	const text = flatten(card);
 	for (const expected of ['明天', '看完', 'docs', '跑一次', '测试']) {
 		if (!text.includes(expected)) throw new Error(`card text is missing ${expected}: ${text}`);
@@ -522,22 +531,6 @@ check('component renders a card for a Markdown draft', () => {
 	if (!collect(card, node => node.type === 'h2').length) throw new Error('heading not rendered');
 	if (!collect(card, node => node.type === 'ul').length) throw new Error('list not rendered');
 	if (!collect(card, node => node.type === 'strong').length) throw new Error('strong not rendered');
-});
-
-check('component header collapses and expands the body', () => {
-	const card = renderDock('- 一\n- 二');
-	const head = card.children[0];
-	const headButton = head.children[0];
-	if (typeof headButton.props.onClick !== 'function') throw new Error('header is not a button');
-	equal(headButton.props['aria-expanded'], true, 'expanded by default');
-	headButton.props.onClick();
-	const collapsed = renderDock('- 一\n- 二');
-	if (collapsed === null) throw new Error('collapsed card disappeared');
-	if (collect(collapsed, node => node.type === 'ul').length) throw new Error('body still rendered while collapsed');
-	if (!flatten(collapsed).includes('title')) throw new Error('header text lost while collapsed');
-	collapsed.children[0].children[0].props.onClick();
-	const reopened = renderDock('- 一\n- 二');
-	if (!collect(reopened, node => node.type === 'ul').length) throw new Error('body did not come back');
 });
 
 check('the MD pill turns the whole feature off and on', () => {
@@ -571,8 +564,10 @@ check('component shows only a notice for oversized Markdown drafts', () => {
 	if (card === null) throw new Error('oversized Markdown draft should still show its header');
 	const text = flatten(card);
 	if (!text.includes('meta.overflow')) throw new Error(`notice missing: ${text.slice(0, 120)}`);
-	const bodies = collect(card, node => node.props?.className === 'dcmp-body');
-	equal(bodies.length, 0, 'rendered bodies');
+	const bodies = collect(card, node => node.props?.className === 'dcmp-md');
+	equal(bodies.length, 0, 'no rendered body for an oversized draft');
+	const notices = collect(card, node => node.props?.className === 'dcmp-notice');
+	equal(notices.length, 1, 'notice rendered');
 });
 
 check('component stays hidden for oversized plain prose', () => {
