@@ -117,10 +117,17 @@ globalThis.window = {
 		setItem: (key, value) => storage.set(key, String(value)),
 	},
 };
+const pasteListeners = [];
 globalThis.document = {
 	head: { appendChild() {} },
 	createElement: () => ({ dataset: {}, textContent: '', remove() {} }),
 	querySelector: () => null,
+	addEventListener: (type, listener) => { if (type === 'paste') pasteListeners.push(listener); },
+	removeEventListener: (type, listener) => {
+		if (type !== 'paste') return;
+		const index = pasteListeners.indexOf(listener);
+		if (index !== -1) pasteListeners.splice(index, 1);
+	},
 };
 
 const reactStub = {
@@ -196,7 +203,10 @@ check('apply registers both slot entries', () => {
 		'conversation.input.left#composer-md-preview-toggle@100',
 		'conversation.user.text.node',
 		'conversation.user.text.node#text@p50',
+		'settings.general.item',
+		'settings.general.item#composer-md-preview-autofence@30',
 	], 'registrations');
+	if (pasteListeners.length !== 1) throw new Error('paste listener was not installed');
 	if (dictionaries.length !== 1) throw new Error('dictionary registration missing');
 });
 
@@ -629,6 +639,165 @@ check('a sent message follows the preview switch', () => {
 	equal(renderUser('- 一').type, 'div', 'enabled renders Markdown');
 });
 // #endregion
+
+console.log('\npasted code');
+const { fenceForPaste, detectLanguage, looksLikeCode, pasteWithBreaks } = internals;
+
+function fenced(label, text, lang) {
+	check(`fences ${label}`, () => {
+		const result = fenceForPaste(text);
+		if (result === null) throw new Error('not treated as code');
+		const lines = result.split('\n');
+		equal(lines[0], `\`\`\`${lang}`, 'opening fence');
+		equal(lines[lines.length - 1], '\`\`\`', 'closing fence');
+	});
+}
+
+fenced('JavaScript', 'const a = 1;\nfunction f() {\n  return a;\n}', 'javascript');
+fenced('TypeScript', "interface Point { x: number }\nconst p: Point = { x: 1 };", 'typescript');
+fenced('Python', 'def add(a, b):\n    return a + b', 'python');
+fenced('C', '#include <stdio.h>\nint main(void) {\n  printf("hi");\n  return 0;\n}', 'c');
+fenced('C++', '#include <iostream>\nint main() { std::cout << "x"; }', 'cpp');
+fenced('shell', 'cd /home/dsh\ngit status --short', 'bash');
+fenced('a shebang script', '#!/usr/bin/env bash\nset -e\necho hi', 'bash');
+fenced('HTML', '<div class="a">\n  <span>hi</span>\n</div>', 'html');
+fenced('JSON', '{"a": 1,\n "b": [1, 2]}', 'json');
+fenced('SQL', 'SELECT id, name\nFROM users\nWHERE id = 1;', 'sql');
+fenced('Go', 'package main\n\nfunc main() {\n\tprintln("hi")\n}', 'go');
+fenced('Rust', 'fn main() {\n    let mut x = 1;\n}', 'rust');
+fenced('Java', 'public class A {\n  public static void main(String[] a) {\n    System.out.println(1);\n  }\n}', 'java');
+fenced('a diff', '--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b', 'diff');
+fenced('YAML', 'name: demo\nversion: 1.0\nitems:\n  - a', 'yaml');
+fenced('a one-line JSON payload', '{"sessionId":"abc","turn":3}', 'json');
+
+check('prose is never fenced', () => {
+	const prose = [
+		'明天下午三点开会，记得带电脑。\n地点还是老地方，别迟到。',
+		'This is a paragraph of ordinary prose.\nIt runs across two lines and has no code in it.',
+		'- 牛奶\n- 鸡蛋\n- 面包',
+		'- milk\n- eggs',
+		'hello',
+		'https://example.com/a/b?c=d',
+		'注意 {} 这种写法\n然后再说一遍',
+	];
+	for (const text of prose) {
+		equal(fenceForPaste(text), null, `fenceForPaste(${JSON.stringify(text.slice(0, 24))})`);
+	}
+});
+
+check('an existing fence and edge cases are left alone', () => {
+	equal(fenceForPaste('```js\nconst a = 1\n```'), null, 'already fenced');
+	equal(fenceForPaste(''), null, 'empty');
+	equal(fenceForPaste('   \n\n'), null, 'blank');
+	equal(fenceForPaste('npm install'), null, 'single command');
+	equal(fenceForPaste('x'.repeat(500000)), null, 'oversized paste');
+});
+
+check('line endings and trailing blank lines are normalized', () => {
+	const result = fenceForPaste('const a = 1;\r\nconst b = 2;\r\n\r\n');
+	equal(result, '```javascript\nconst a = 1;\nconst b = 2;\n```', 'normalized fence');
+});
+
+check('the fence is padded so it starts and ends on its own line', () => {
+	equal(pasteWithBreaks('```js\nx\n```', true), '```js\nx\n```\n', 'at line start');
+	equal(pasteWithBreaks('```js\nx\n```', false), '\n\n```js\nx\n```\n', 'mid-line');
+});
+
+check('the paste handler rewrites only a composer code paste', () => {
+	class FakeElement {
+		constructor({ editable = false, inComposer = true } = {}) {
+			this.isContentEditable = editable;
+			this.inComposer = inComposer;
+		}
+		closest(selector) {
+			if (selector === '[data-composer-card]') return this.inComposer ? this : null;
+			return null;
+		}
+	}
+	globalThis.Element = FakeElement;
+	globalThis.Node = { ELEMENT_NODE: 1 };
+	globalThis.window.getSelection = () => ({
+		rangeCount: 1,
+		getRangeAt: () => ({ startContainer: {}, startOffset: 0 }),
+	});
+	globalThis.document.createRange = () => ({ selectNodeContents() {}, setEnd() {}, toString: () => '' });
+
+	const listener = pasteListeners[0];
+	if (listener === undefined) throw new Error('paste listener missing');
+	let rewritten = null;
+	const event = ({ text, shift = false, files = [], editable = true, inComposer = true }) => ({
+		shiftKey: shift,
+		target: new FakeElement({ editable, inComposer }),
+		clipboardData: {
+			files,
+			getData: () => text,
+			setData: (type, value) => { if (type === 'text/plain') rewritten = value; },
+		},
+	});
+	const reset = () => { rewritten = null; };
+	const code = 'const a = 1;\nconst b = 2;';
+
+	reset();
+	listener(event({ text: code }));
+	equal(rewritten, '```javascript\nconst a = 1;\nconst b = 2;\n```\n', 'composer code paste');
+
+	reset();
+	listener(event({ text: code, shift: true }));
+	equal(rewritten, null, 'shift paste');
+
+	reset();
+	listener(event({ text: code, inComposer: false }));
+	equal(rewritten, null, 'paste outside the composer');
+
+	reset();
+	listener(event({ text: code, editable: false }));
+	equal(rewritten, null, 'paste outside the editor');
+
+	reset();
+	listener(event({ text: code, files: [{}] }));
+	equal(rewritten, null, 'paste carrying files');
+
+	reset();
+	listener(event({ text: '一段普通的文字\n还有第二行' }));
+	equal(rewritten, null, 'prose');
+
+	reset();
+	storage.set('dsh-composer-md-preview/v1', JSON.stringify({ enabled: true, collapsed: false, autoFence: false }));
+	internals.readPrefs();
+	listener(event({ text: code }));
+	equal(rewritten, null, 'auto-fence switched off in Settings');
+
+	storage.set('dsh-composer-md-preview/v1', JSON.stringify({ enabled: false, collapsed: false, autoFence: true }));
+	internals.readPrefs();
+	listener(event({ text: code }));
+	equal(rewritten, null, 'master switch off');
+
+	storage.set('dsh-composer-md-preview/v1', JSON.stringify({ enabled: true, collapsed: false, autoFence: true }));
+	internals.readPrefs();
+	listener(event({ text: code }));
+	equal(typeof rewritten, 'string', 'back on');
+});
+
+check('the Settings row toggles the paste rewrite', () => {
+	const row = internals.AutoFenceRow({ t: key => key });
+	if (row === null || row.type !== 'div') throw new Error('row not rendered');
+	const control = row.children[1];
+	equal(control.type, 'button', 'control element');
+	equal(control.props.role, 'switch', 'role');
+	equal(control.props['aria-checked'], true, 'checked state');
+	control.props.onClick();
+	equal(internals.AutoFenceRow({ t: key => key }).children[1].props['aria-checked'], false, 'after toggle');
+	const persisted = storage.get('dsh-composer-md-preview/v1');
+	if (typeof persisted !== 'string' || !persisted.includes('"autoFence":false')) throw new Error(`preference not persisted: ${persisted}`);
+	internals.AutoFenceRow({ t: key => key }).children[1].props.onClick();
+	equal(internals.AutoFenceRow({ t: key => key }).children[1].props['aria-checked'], true, 'back on');
+});
+
+check('the classifier and language picker are exposed', () => {
+	equal(looksLikeCode('const a = 1;\nconst b = 2;'), true, 'looksLikeCode');
+	equal(looksLikeCode('普通文字\n还是不 fencing'), false, 'prose');
+	equal(detectLanguage('SELECT 1;\nFROM t'), 'sql', 'language');
+});
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures > 0) {

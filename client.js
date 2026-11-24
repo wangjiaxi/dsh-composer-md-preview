@@ -45,11 +45,12 @@ window.__ModuleLoader__.load({
 		/**
 		 * Persisted preferences, shared by both slot entries.
 		 *
-		 * `enabled` is the user's switch (the MD pill and the card's × both write
-		 * it). `collapsed` is the card's own disclosure state; it survives a
-		 * remount so switching sessions does not reopen a card the user folded.
+		 * `enabled` is the master switch (the MD pill writes it). `collapsed` is the
+		 * card's own disclosure state; it survives a remount so switching sessions
+		 * does not reopen a card the user folded. `autoFence` wraps a pasted code
+		 * chunk in a fenced block; its own row lives in Settings > General.
 		 */
-		let prefs = { enabled: true, collapsed: false };
+		let prefs = { enabled: true, collapsed: false, autoFence: true };
 		let prefsSnapshot = prefs;
 		const prefsListeners = new Set();
 
@@ -61,6 +62,7 @@ window.__ModuleLoader__.load({
 				if (parsed === null || typeof parsed !== 'object') return;
 				if (typeof parsed.enabled === 'boolean') prefs.enabled = parsed.enabled;
 				if (typeof parsed.collapsed === 'boolean') prefs.collapsed = parsed.collapsed;
+				if (typeof parsed.autoFence === 'boolean') prefs.autoFence = parsed.autoFence;
 				prefsSnapshot = { ...prefs };
 			} catch (error) {
 				console.warn('[composer-md-preview] could not read preferences', error);
@@ -732,6 +734,183 @@ window.__ModuleLoader__.load({
 		}
 		// #endregion
 
+		// #region paste
+		/**
+		 * Pasted code arrives as a fenced block.
+		 *
+		 * The composer's editor reads only `text/plain` from the paste event and
+		 * inserts it; a capture-phase listener can therefore rewrite what it is
+		 * about to read, and the editor inserts the fenced source with its own
+		 * history entry, caret and undo intact. No DOM is written, and when the
+		 * rewrite does not take (files in the clipboard, a platform that refuses
+		 * `setData` on a paste handler) the raw text lands and nothing is lost.
+		 */
+		/** A paste that already carries a fence is left alone. */
+		const FENCED = /^ {0,3}(`{3,}|~{3,})/m;
+		/** Pastes above this size skip classification entirely. */
+		const MAX_PASTE_CHARS = 400000;
+		/** CJK ranges: a line carrying them is prose unless it also carries source. */
+		const CJK = /[\u3400-\u4dbf\u4e00-\u9fff]/;
+		/** One line that reads as source rather than prose. */
+		const STRONG_LINE = /[{}]|;\s*$|(?:=>|::|->|\+\+|===|!==|&&|\|\||\+=|-=|\*=|\/=)|^@@|^[-+]{3}\s|^(?:#!|#include|#define|<\?php|<!doctype|<html|<\/?[a-z][a-z0-9-]*[\s>])|^\s*(?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH)\b|^\s*(?:sudo\s+)?(?:git|npm|pnpm|yarn|npx|node|python3?|pip3?|cargo|go|docker|kubectl|systemctl|journalctl|cd|ls|cat|echo|curl|wget|rm|cp|mv|mkdir|chmod|chown|tar|unzip|ssh|scp|dsh|make|gcc|g\+\+|clang|find|grep|sed|awk|export|source)\b/i;
+		/** Source-shaped line that also occurs in prose (`key: value`). */
+		const WEAK_LINE = /^\s*[\w.$-]+\s*[:=]\s*\S|^\s*["'].*["'],?\s*$/;
+		/** A command line (no language tells a script apart from prose other than this). */
+		const SHELL_LINE = /^(?:sudo\s+)?(?:(?:git|npm|pnpm|yarn|npx|node|python3?|pip3?|cargo|go|docker|kubectl|systemctl|journalctl|cd|ls|cat|echo|curl|wget|rm|cp|mv|mkdir|chmod|chown|tar|unzip|ssh|scp|dsh|make|gcc|g\+\+|clang|find|grep|sed|awk|export|source)\b|\.\/\S)/;
+		/** Keyword-led line that is only ever source. */
+		const KEYWORD_LINE = /^\s*(?:export\s+)?(?:async\s+)?(?:def|class|function|import|from|const|let|var|return|if|for|while|switch|try|catch|pub|fn|impl|use|mod|package|func|struct|enum|interface|type|namespace|public|private|protected|static|void|int|char|float|double|template)\b/;
+
+		/** @returns whether `text` parses as JSON. */
+		function isJsonText(text) {
+			try {
+				JSON.parse(text);
+				return true;
+			} catch {
+				return false;
+			}
+		}
+
+		/**
+		 * Decide whether a pasted chunk reads as source rather than prose.
+		 *
+		 * Deliberately conservative: a false positive would fence a paragraph,
+		 * while a false negative only leaves the text raw, which the user can fix
+		 * by typing three backticks.
+		 * @param text - pasted text, already newline-normalized.
+		 * @returns whether the chunk should be fenced.
+		 */
+		function looksLikeCode(text) {
+			const filled = text.split('\n').map(line => line.replace(/\s+$/, '')).filter(line => line.trim() !== '');
+			if (filled.length === 0) return false;
+			const trimmed = text.trim();
+			if (filled.length === 1) return trimmed.length >= 20 && isJsonText(trimmed);
+			if ((trimmed.startsWith('{') || trimmed.startsWith('[')) && isJsonText(trimmed)) return true;
+
+			let strong = 0;
+			let weak = 0;
+			let prose = 0;
+			for (const line of filled) {
+				if (STRONG_LINE.test(line) || KEYWORD_LINE.test(line) || /^[\t ]{2,}\S/.test(line)) strong += 1;
+				else if (WEAK_LINE.test(line)) weak += 1;
+				else if (CJK.test(line)) prose += 1;
+			}
+			// A mostly-Chinese paste with a couple of braces is a sentence, not code.
+			if (prose > strong) return false;
+			const score = strong + weak * 0.5;
+			if (score < Math.max(2, filled.length * 0.3)) return false;
+			return strong >= 2 || (strong >= 1 && weak >= 2);
+		}
+
+		/**
+		 * Name the language of a fenced block, best effort.
+		 * @param text - the code chunk.
+		 * @returns a fence info string, or '' when the language is unknown.
+		 */
+		function detectLanguage(text) {
+			const head = text.trimStart();
+			if (/^#!.*\b(?:bash|sh|zsh)\b/.test(head)) return 'bash';
+			if (/^#!.*\bnode\b/.test(head)) return 'javascript';
+			if (/^#!.*\bpython/.test(head)) return 'python';
+			if (/^<\?php/.test(head)) return 'php';
+			if (/^(?:<!doctype html|<html[\s>])/i.test(head)) return 'html';
+			if (/^<[a-z][a-z0-9-]*[\s>]/i.test(head) && /<\/[a-z]/i.test(text)) return 'html';
+			const trimmed = text.trim();
+			if ((trimmed.startsWith('{') || trimmed.startsWith('[')) && isJsonText(trimmed)) return 'json';
+			if (/^\s*(?:\+\+\+|---)\s+[ab]\//m.test(text)) return 'diff';
+			if (/#include\s*[<"]/.test(text)) return /std::|#include\s*<iostream>/.test(text) ? 'cpp' : 'c';
+			if (/\bpackage\s+main\b/.test(text) && /\bfunc\s+\w+\s*\(/.test(text)) return 'go';
+			if (/\bfn\s+\w+\s*\(|\blet\s+mut\s|\bimpl\s+\w+|\bpub\s+fn\b/.test(text)) return 'rust';
+			if (/\bpublic\s+class\b|\bSystem\.out\.println|\bpublic\s+static\s+void\s+main\b/.test(text)) return 'java';
+			if (/\b(?:SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|CREATE\s+TABLE|ALTER\s+TABLE)\b/i.test(text)) return 'sql';
+			if (/^\s*(?:async\s+)?def\s+\w+\s*\(|^\s*from\s+[\w.]+\s+import\s+\w|^\s*import\s+[\w.]+(?:\s+as\s+\w+)?\s*$/m.test(text)) return 'python';
+			if (/=>|\bconsole\.log\b|^\s*(?:const|let)\s+[\w{[]|^\s*(?:async\s+)?function\s+\w+/m.test(text)) {
+				return /:\s*(?:string|number|boolean|void|unknown|any|never)\b|\binterface\s+\w+|\btype\s+\w+\s*=|:\s*[A-Z]\w*\[?/.test(text)
+					? 'typescript'
+					: 'javascript';
+			}
+			if (/^[.#]?[\w-]+[^{}]*\{[^{}]*:[^{}]*\}/m.test(text)) return 'css';
+			const commands = text.split('\n').map(line => line.trim()).filter(line => line !== '');
+			if (commands.length >= 2 && commands.every(line => SHELL_LINE.test(line))) return 'bash';
+			if (/^\s*[\w.-]+\s*:\s+\S/m.test(text) && !/[{};=]/.test(text)) return 'yaml';
+			return '';
+		}
+
+		/**
+		 * Build the clipboard replacement for one paste, if any.
+		 * @param raw - the pasted `text/plain`.
+		 * @returns fenced source, or null to leave the paste untouched.
+		 */
+		function fenceForPaste(raw) {
+			if (typeof raw !== 'string' || raw.trim() === '') return null;
+			const text = raw.replace(/\r\n?/g, '\n');
+			if (text.length > MAX_PASTE_CHARS) return null;
+			if (FENCED.test(text)) return null;
+			if (!looksLikeCode(text)) return null;
+			const language = detectLanguage(text);
+			return '```' + language + '\n' + text.replace(/\n+$/, '') + '\n```';
+		}
+
+		/**
+		 * Pad a fenced block so it starts and ends on its own lines.
+		 * @param fenced - the fenced source.
+		 * @param atLineStart - whether the caret already sits at its line start.
+		 * @returns the text to paste.
+		 */
+		function pasteWithBreaks(fenced, atLineStart) {
+			return (atLineStart ? '' : '\n\n') + fenced + '\n';
+		}
+
+		/**
+		 * Whether the caret sits at the start of its paragraph.
+		 * @param fallback - answer when the selection cannot be read.
+		 * @returns whether the text before the caret in its block is blank.
+		 */
+		function caretAtLineStart(fallback) {
+			const selection = window.getSelection();
+			if (selection === null || selection.rangeCount === 0) return fallback;
+			const range = selection.getRangeAt(0);
+			const start = range.startContainer;
+			const element = start.nodeType === Node.ELEMENT_NODE ? start : start.parentElement;
+			if (element === null || element === undefined) return fallback;
+			const block = element.closest('p, li, h1, h2, h3, h4, h5, h6, div');
+			if (block === null) return fallback;
+			const probe = document.createRange();
+			probe.selectNodeContents(block);
+			try {
+				probe.setEnd(range.startContainer, range.startOffset);
+			} catch {
+				return fallback;
+			}
+			return probe.toString().trim() === '';
+		}
+
+		/** Install the paste rewrite; returns its disposer. */
+		function installPasteFence() {
+			const onPaste = event => {
+				if (!prefsSnapshot.enabled || !prefsSnapshot.autoFence) return;
+				// An explicit "paste as plain text" gesture asks for the text as is.
+				if (event.shiftKey) return;
+				const target = event.target;
+				if (!(target instanceof Element) || target.isContentEditable !== true) return;
+				if (target.closest('[data-composer-card]') === null) return;
+				const data = event.clipboardData;
+				if (data === null) return;
+				if (data.files !== null && data.files !== undefined && data.files.length > 0) return;
+				const fenced = fenceForPaste(data.getData('text/plain'));
+				if (fenced === null) return;
+				try {
+					// A read-only clipboard surface would throw here; the browser's own
+					// paste then proceeds with the untouched text.
+					data.setData('text/plain', pasteWithBreaks(fenced, caretAtLineStart(true)));
+				} catch (error) {
+					console.warn('[composer-md-preview] could not rewrite the pasted text', error);
+				}
+			};
+			document.addEventListener('paste', onPaste, true);
+			return () => document.removeEventListener('paste', onPaste, true);
+		}
+		// #endregion
+
 		// #region components
 		/** Icon: a chevron, drawn inline so the plugin needs no icon package. */
 		function Chevron({ open }) {
@@ -840,6 +1019,38 @@ window.__ModuleLoader__.load({
 				},
 				h('span', { className: 'dcmp-toggle-mark', 'aria-hidden': 'true' }, 'MD'),
 				h('span', { className: 'dcmp-dot', 'data-on': on ? 'true' : 'false', 'aria-hidden': 'true' }),
+			);
+		}
+
+
+		/**
+		 * Settings > General row for the paste rewrite.
+		 * @param props - slot props: `t` locale seat.
+		 */
+		function AutoFenceRow({ t }) {
+			const translate = typeof t === 'function' ? t : key => key;
+			const prefsNow = usePrefs();
+			return h(
+				'div',
+				{ className: 'dcmp-setting' },
+				h(
+					'div',
+					{ className: 'dcmp-setting-text' },
+					h('div', { className: 'dcmp-setting-title' }, translate('setting.autoFence.title')),
+					h('div', { className: 'dcmp-setting-desc' }, translate('setting.autoFence.desc')),
+				),
+				h(
+					'button',
+					{
+						type: 'button',
+						role: 'switch',
+						className: 'dcmp-switch',
+						'aria-checked': prefsNow.autoFence,
+						'aria-label': translate('setting.autoFence.title'),
+						onClick: () => commitPrefs({ autoFence: !prefsNow.autoFence }),
+					},
+					h('span', { className: 'dcmp-thumb' }),
+				),
 			);
 		}
 
@@ -953,6 +1164,15 @@ h3.dcmp-heading{font-size:1.08em}
 .dcmp-toggle[aria-pressed="false"] .dcmp-toggle-mark{text-decoration:line-through}
 .dcmp-dot{box-sizing:border-box;width:6px;height:6px;border:1px solid var(--dsw-alias-label-tertiary,rgb(0 0 0/30%));border-radius:50%;background:transparent;transition:background-color 120ms,border-color 120ms}
 .dcmp-dot[data-on="true"]{border-color:var(--dsw-alias-state-business-primary,#4d6bfe);background:var(--dsw-alias-state-business-primary,#4d6bfe)}
+.dcmp-setting{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:16px 0;border-bottom:.5px solid var(--dsw-alias-border-l2,rgb(0 0 0/18%))}
+.dcmp-setting-text{min-width:0;display:flex;flex-direction:column;gap:4px}
+.dcmp-setting-title{font-size:14px;line-height:20px;color:var(--dsw-alias-label-primary,inherit)}
+.dcmp-setting-desc{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary,inherit)}
+.dcmp-switch{box-sizing:border-box;position:relative;flex:0 0 auto;width:36px;height:20px;margin:0;padding:2px;border:0;border-radius:999px;background:var(--dsw-alias-border-l3,rgb(0 0 0/20%));cursor:pointer}
+.dcmp-switch[aria-checked="true"]{background:var(--dsw-alias-brand-primary,#4d6bfe)}
+.dcmp-switch:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary,#4d6bfe));outline-offset:2px}
+.dcmp-thumb{display:block;width:16px;height:16px;border-radius:50%;background:var(--dsw-alias-switch-thumb,#fff);transition:transform 120ms ease}
+.dcmp-switch[aria-checked="true"] .dcmp-thumb{transform:translate(16px)}
 `;
 
 		function installStyles() {
@@ -979,6 +1199,8 @@ h3.dcmp-heading{font-size:1.08em}
 			'toggle.label': 'Markdown 预览开关',
 			'toggle.on': 'Markdown 预览已开启：草稿出现 Markdown 语法时显示，已发送的消息也按 Markdown 显示',
 			'toggle.off': 'Markdown 预览已关闭：草稿不渲染，已发送的消息按原文显示',
+			'setting.autoFence.title': '粘贴代码自动加代码块',
+			'setting.autoFence.desc': '把代码粘进输入框时自动包成 ``` 代码块，并尽量标上语言（JavaScript、TypeScript、Python、C/C++、Go、Rust、Java、SQL、HTML、JSON、Shell 等）；按住 Shift 粘贴则保持原文，普通文字不会被改动。',
 		};
 		const en = {
 			title: 'Markdown preview',
@@ -993,6 +1215,8 @@ h3.dcmp-heading{font-size:1.08em}
 			'toggle.label': 'Markdown preview switch',
 			'toggle.on': 'Markdown preview is on: the draft renders once it contains Markdown, and sent messages render too',
 			'toggle.off': 'Markdown preview is off: no draft card, and sent messages show their raw text',
+			'setting.autoFence.title': 'Fence pasted code',
+			'setting.autoFence.desc': 'Wraps code pasted into the composer in a ``` block and names the language when it can (JavaScript, TypeScript, Python, C/C++, Go, Rust, Java, SQL, HTML, JSON, Shell). Hold Shift while pasting to keep the text as is; ordinary prose is never rewritten.',
 		};
 		// #endregion
 
@@ -1024,6 +1248,11 @@ h3.dcmp-heading{font-size:1.08em}
 				{ name: 'conversation.user.text.node', key: 'text', priority: 50, locale: NS },
 				UserMarkdown,
 			));
+			ctx.effect(() => installPasteFence(), 'dsh-composer-md-preview: code paste');
+			ctx.slots.inject('settings.general.item', () => ctx.slots.register(
+				{ name: 'settings.general.item', id: 'composer-md-preview-autofence', order: 30, locale: NS },
+				AutoFenceRow,
+			));
 			console.info(`[${NS}] ready — ${t('title')}`);
 		}
 		// #endregion
@@ -1031,7 +1260,11 @@ h3.dcmp-heading{font-size:1.08em}
 		exports.apply = apply;
 		exports.inject = inject;
 		/** Internal surface for scripts/validate.mjs; not part of the plugin API. */
-		exports.__internals = { looksLikeMarkdown, parseInline, parseBlocks, renderBlocks, PreviewDock, PreviewToggle, UserMarkdown, readPrefs };
+		exports.__internals = {
+			looksLikeMarkdown, parseInline, parseBlocks, renderBlocks,
+			PreviewDock, PreviewToggle, UserMarkdown, AutoFenceRow, readPrefs,
+			looksLikeCode, detectLanguage, fenceForPaste, pasteWithBreaks,
+		};
 		return module.exports;
 	},
 });

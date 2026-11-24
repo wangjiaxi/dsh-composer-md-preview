@@ -1,8 +1,8 @@
 {
   "name": "dsh-composer-md-preview",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
-  "description": "Renders your own messages as Markdown in DeepSeek Harness: a live preview card above the composer, and sent messages rendered in the transcript",
+  "description": "Renders your own messages as Markdown in DeepSeek Harness: a live preview card above the composer, sent messages rendered in the transcript, and pasted code fenced automatically",
   "keywords": [
     "dsh-plugin",
     "dsh",

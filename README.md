@@ -31,11 +31,41 @@ Two halves of one idea — your Markdown reads as Markdown, not as markers.
    conversation, in the same bubble as before, using the same renderer as the
    draft card. Assistant messages were always rendered; now your own messages
    match them.
+3. **Pasted code.** Pasting a code chunk into the composer wraps it in a fenced
+   block, with the language named when it can tell — no more hand-typing three
+   backticks around a function.
 
 The `MD` button in the composer tool row is the master switch for both. Turn it
 off and the card disappears and your messages show their raw text again. The
 choice is stored in `localStorage` (`dsh-composer-md-preview/v1`), so it
 survives a reload and applies to every session.
+
+## Pasted code
+
+Paste a snippet and it arrives as a Markdown fenced block, so the preview card
+and the sent message both show it as a code block:
+
+````text
+before:  function f() { return 1 }        after:  ```javascript
+                                                  function f() { return 1 }
+                                                  ```
+````
+
+- **It decides, conservatively.** A paste is fenced only when it reads as source
+  (at least two lines, code punctuation/indentation/keywords/commands, not
+  mostly prose). A paragraph, a shopping list, a single word or a URL is left
+  exactly as pasted.
+- **Language names.** JavaScript, TypeScript, Python, C, C++, Go, Rust, Java,
+  SQL, HTML, JSON, YAML, CSS, Shell scripts and diffs are recognized; anything
+  else gets an unlabeled block.
+- **Escapes.** Hold **Shift** while pasting (`Ctrl+Shift+V` / `⇧⌘V`) to keep the
+  text verbatim. You can also turn the rewrite off in **Settings → General →
+  Fence pasted code**; the switch is remembered per browser.
+- **Nothing is destroyed.** The rewrite only changes what the editor receives for
+  that one paste; undo removes it like any other paste. If the platform refuses
+  the rewrite (a clipboard carrying files, or a browser that locks the paste
+  surface), the raw text lands and the feature simply does not engage.
+- Already-fenced text is never re-wrapped.
 
 ## Where it appears
 
@@ -44,6 +74,7 @@ survives a reload and applies to every session.
 | `conversation.input.dock` | `id: composer-md-preview`, order 10 | the preview card, docked beside the Todo and queue cards |
 | `conversation.input.left` | `id: composer-md-preview-toggle`, order 100 | the `MD` pill in the composer tool row |
 | `conversation.user.text.node` | `key: text`, priority 50 | Markdown rendering for the text of a sent message, shadowing the shipped plain-text run (keyed dispatch renders the lowest priority) |
+| `settings.general.item` | `id: composer-md-preview-autofence`, order 30 | the **Fence pasted code** switch in Settings → General |
 
 ## Supported syntax
 
@@ -94,6 +125,10 @@ or reference-style links, and reference-style definitions render literally.
   语法时才会出现，普通文字不会在输入框上方重复一遍。
 - **已发送消息**：发送出去的消息在对话里也按 Markdown 渲染（和助手消息一样），
   位置和气泡样式不变。
+- **粘贴代码自动加代码块**：把一段代码粘进输入框，会自动包成围栏代码块并尽量标上
+  语言（JS/TS/Python/C/C++/Go/Rust/Java/SQL/HTML/JSON/YAML/CSS/Shell/diff）；
+  普通文字、列表、单个词、链接都不会被改动。按住 **Shift** 粘贴保持原文，
+  也可以在 **设置 → 通用 → 粘贴代码自动加代码块** 里关掉。
 - **总开关**：输入框工具行的 `MD` 按钮同时管两件事；关掉后卡片消失、已发送的
   消息恢复原文显示。状态存在 `localStorage`（`dsh-composer-md-preview/v1`）。
 - 支持：标题、段落（保留换行）、粗体/斜体/删除线、行内代码、带语言标签的围栏
