@@ -767,6 +767,7 @@ window.__ModuleLoader__.load({
 			const prefsNow = usePrefs();
 			const anchorRef = React.useRef(null);
 			const [host, setHost] = React.useState(null);
+			const [focused, setFocused] = React.useState(false);
 			const state = typeof useInput === 'function' ? useInput(snapshot => snapshot) : undefined;
 			const draft = typeof state?.draft === 'string' ? state.draft : '';
 			pasteBridge.actions = inputActions !== null && typeof inputActions === 'object' ? inputActions : undefined;
@@ -786,13 +787,54 @@ window.__ModuleLoader__.load({
 				};
 			}, []);
 
+			// The rendering replaces the editing line whenever the composer does not
+			// own focus: the input box shows the Markdown, and a click anywhere in it
+			// hands focus back to the editor, which reappears at the stored caret.
+			React.useEffect(() => {
+				const anchor = anchorRef.current;
+				const card = anchor === null || anchor === undefined ? null : anchor.closest('[data-composer-card]');
+				if (card === null) return undefined;
+				const editable = card.querySelector('[contenteditable]');
+				const inside = element => element !== null && element !== undefined && card.contains(element);
+				const isEditor = element => element !== null && element !== undefined
+					&& (element === editable || (editable !== null && editable.contains(element)));
+				// Only the editor counts as "editing": a toolbar control taking focus
+				// keeps the box in editing mode, while leaving the card renders it.
+				const onFocusIn = event => {
+					if (isEditor(event.target)) setFocused(true);
+				};
+				const onFocusOut = event => {
+					if (inside(event.relatedTarget)) return;
+					setFocused(false);
+				};
+				setFocused(isEditor(document.activeElement));
+				card.addEventListener('focusin', onFocusIn);
+				card.addEventListener('focusout', onFocusOut);
+				return () => {
+					card.removeEventListener('focusin', onFocusIn);
+					card.removeEventListener('focusout', onFocusOut);
+				};
+			}, []);
+
 			const panel = React.useMemo(
-				() => draftPanel({ draft, enabled: prefsNow.enabled, translate }),
-				[draft, prefsNow.enabled, translate],
+				() => (focused || host === null ? null : draftPanel({ draft, enabled: prefsNow.enabled, translate })),
+				[focused, host, draft, prefsNow.enabled, translate],
 			);
+			const reading = panel !== null;
+			React.useEffect(() => {
+				const anchor = anchorRef.current;
+				const card = anchor === null || anchor === undefined ? null : anchor.closest('[data-composer-card]');
+				if (card === null) return undefined;
+				if (reading) card.setAttribute('data-dcmp-reading', '');
+				else card.removeAttribute('data-dcmp-reading');
+				return () => {
+					card.removeAttribute('data-dcmp-reading');
+				};
+			}, [reading]);
+
 			return [
 				h('span', { key: 'anchor', ref: anchorRef, className: 'dcmp-anchor', 'aria-hidden': 'true' }),
-				host === null || panel === null ? null : ReactDOM.createPortal(panel, host),
+				panel === null ? null : ReactDOM.createPortal(panel, host),
 			];
 		}
 
@@ -1139,7 +1181,9 @@ window.__ModuleLoader__.load({
 .dcmp-anchor{display:none}
 .dcmp-host{order:-1;display:block;flex:none;min-width:0}
 .dcmp-host:empty{display:none}
-.dcmp-inline-preview{box-sizing:border-box;min-width:0;max-height:min(40vh,320px);overflow:hidden auto;padding:4px 14px 0;font-size:var(--dsh-content-font-size,14px);line-height:calc(24px + var(--dsh-content-font-delta,0px));color:var(--dsw-alias-label-primary,inherit);cursor:text;--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2,rgb(0 0 0/16%));--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2,rgb(0 0 0/28%));animation:dcmp-fade 160ms ease-out}
+[data-composer-card][data-dcmp-reading] [contenteditable]{height:0;min-height:0;overflow:hidden;padding:0;border:0}
+[data-composer-card][data-dcmp-reading]>.dcmp-host{margin-bottom:-24px}
+.dcmp-inline-preview{box-sizing:border-box;min-width:0;cursor:text;max-height:min(40vh,320px);overflow:hidden auto;padding:4px 14px 0;font-size:var(--dsh-content-font-size,14px);line-height:calc(24px + var(--dsh-content-font-delta,0px));color:var(--dsw-alias-label-primary,inherit);--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2,rgb(0 0 0/16%));--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2,rgb(0 0 0/28%));animation:dcmp-fade 160ms ease-out}
 @keyframes dcmp-fade{from{opacity:0}to{opacity:1}}
 @media (prefers-reduced-motion:reduce){.dcmp-inline-preview{animation:none}}
 .dcmp-inline-preview a{pointer-events:none}

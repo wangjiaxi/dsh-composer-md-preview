@@ -24,14 +24,13 @@ Requires DSH `0.2.2-rc.3` or newer within the `0.2.x` line.
 
 Two halves of one idea — your Markdown reads as Markdown, not as markers.
 
-1. **Draft preview inside the input box.** The rendered draft is mounted
-   *inside* the composer card's own content area — a block at the top of the
-   input box, above the editing line, under the card's padding, radius and
-   surface. There is no second box, no shadow, no header: the input box's height
-   grows to hold it. It appears only when the draft actually contains Markdown
-   syntax, so plain prose leaves the input box exactly as the shell drew it.
-   The editing line stays: that layer is DSH's own Lexical editor, and a plugin
-   cannot draw rich content inside it.
+1. **The input box renders the draft.** When the draft contains Markdown
+   syntax, the rendered version **replaces** the raw text inside the composer
+   card: the box shows the message as it will read, with a tool row under it,
+   and no second surface anywhere. Click the rendered text to edit — the raw
+   line comes back, exactly where the shell drew it — and click outside to see
+   it rendered again. Plain prose, or the switch turned off, leaves the input
+   box untouched.
 2. **Sent messages.** A message you send renders as Markdown in the
    conversation, in the same bubble as before, using the same renderer as the
    draft card. Assistant messages were always rendered; now your own messages
@@ -77,7 +76,7 @@ before:  function f() { return 1 }        after:  ```javascript
 
 | Registration | Slot | What it is |
 | --- | --- | --- |
-| `conversation.input.left` | `id: composer-md-preview-bridge`, order 101 | the seat inside the composer card; it portals the rendered draft into a container appended to that card (ordered first), and publishes the action face used by the paste handler |
+| `conversation.input.left` | `id: composer-md-preview-bridge`, order 101 | the seat inside the composer card; it portals the rendered draft into a container appended to that card (ordered first), hides the raw editing line while it renders, and publishes the action face used by the paste handler |
 | `conversation.input.left` | `id: composer-md-preview-toggle`, order 100 | the `MD` pill in the composer tool row |
 | `conversation.user.text.node` | `key: text`, priority 50 | Markdown rendering for the text of a sent message, shadowing the shipped plain-text run (keyed dispatch renders the lowest priority) |
 | `settings.general.item` | `id: composer-md-preview-autofence`, order 30 | the **Fence pasted code** switch in Settings → General |
@@ -127,11 +126,11 @@ or reference-style links, and reference-style definitions render literally.
 
 安装：`dsh plugin --profile web add github:wangjiaxi/dsh-composer-md-preview`，刷新一次页面——插件页显示「Markdown 预览」，输入框工具行出现 `MD`。要求 DSH `0.2.2-rc.3` 及以上（0.2.x 线）。
 
-- **草稿预览（在原生输入框内部）**：渲染结果被挂进输入框卡片的**内容区**里——
-  就在卡片内部最上面，用卡片自己的内边距、圆角和底色，卡片长高来容纳它；
-  没有第二块面板、没有阴影、没有标题栏。只有草稿出现 Markdown 语法时才出现，
-  普通文字仍是原来那个输入框。原文行保留：那一层是 DSH 自己的 Lexical 编辑器，
-  插件无法在它里面画富文本。
+- **输入框直接渲染**：草稿里出现 Markdown 语法（且开关打开）时，输入框里显示的
+  就是渲染结果——原文行被收起来，同一个卡片、同一个内边距和圆角，卡片下面还是
+  发送那一行工具条，没有任何第二块面板。**点一下渲染结果就能回到原文编辑**，
+  光标回到原来的位置；点到卡片外面，又重新渲染。普通文字或关掉开关时，输入框
+  和原厂一模一样。
 - **已发送消息**：发送出去的消息在对话里也按 Markdown 渲染（和助手消息一样），
   位置和气泡样式不变。
 - **粘贴代码自动加代码块**：把一段代码粘进输入框，会自动包成围栏代码块并尽量标上

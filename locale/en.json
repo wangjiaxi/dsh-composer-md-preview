@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Markdown preview",
-    "description": "Renders your own messages as Markdown, in the draft and in the transcript. While you type, the rendered message appears inside the native input box itself — lists, numbering, bold, quotes, tables and code blocks instead of raw markers; after sending, your messages show the same way in the conversation. Pasting a code chunk wraps it in a fenced block and names the language when it can tell. The card appears only once the draft contains Markdown syntax, and the MD button in the composer tool row is the master switch. Parsing happens in the browser only: the model still receives the original Markdown and the session log is unchanged.",
+    "description": "Renders your own messages as Markdown, in the draft and in the transcript. The native input box shows the rendered message and hides the raw line, with a click to edit — lists, numbering, bold, quotes, tables and code blocks instead of raw markers; after sending, your messages show the same way in the conversation. Pasting a code chunk wraps it in a fenced block and names the language when it can tell. The card appears only once the draft contains Markdown syntax, and the MD button in the composer tool row is the master switch. Parsing happens in the browser only: the model still receives the original Markdown and the session log is unchanged.",
     "detail": "docs/DETAIL.md"
   }
 }
