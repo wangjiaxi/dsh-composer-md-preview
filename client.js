@@ -745,6 +745,27 @@ window.__ModuleLoader__.load({
 		 * rewrite does not take (files in the clipboard, a platform that refuses
 		 * `setData` on a paste handler) the raw text lands and nothing is lost.
 		 */
+		/**
+		 * Live composer handle for the document-level paste listener.
+		 *
+		 * The listener runs outside React, so it cannot read a prop. `PasteBridge`
+		 * publishes the session's stable action face here on every render.
+		 */
+		const pasteBridge = { actions: undefined };
+
+		/**
+		 * Publish the composer's action face for the paste listener.
+		 *
+		 * Renders nothing: the composer's tool row keeps its layout, the listener
+		 * gets a handle that outlives a re-render.
+		 * @param props - slot props: the session's input actions.
+		 * @returns nothing.
+		 */
+		function PasteBridge({ inputActions }) {
+			pasteBridge.actions = inputActions !== null && typeof inputActions === 'object' ? inputActions : undefined;
+			return null;
+		}
+
 		/** A paste that already carries a fence is left alone. */
 		const FENCED = /^ {0,3}(`{3,}|~{3,})/m;
 		/** Pastes above this size skip classification entirely. */
@@ -817,7 +838,9 @@ window.__ModuleLoader__.load({
 			const trimmed = text.trim();
 			if ((trimmed.startsWith('{') || trimmed.startsWith('[')) && isJsonText(trimmed)) return 'json';
 			if (/^\s*(?:\+\+\+|---)\s+[ab]\//m.test(text)) return 'diff';
-			if (/#include\s*[<"]/.test(text)) return /std::|#include\s*<iostream>/.test(text) ? 'cpp' : 'c';
+			if (/#include\s*[<"]/.test(text)) {
+				return /std::|#include\s*<(?:iostream|bits\/)|using\s+namespace\s+std|std::cout|std::cin/.test(text) ? 'cpp' : 'c';
+			}
 			if (/\bpackage\s+main\b/.test(text) && /\bfunc\s+\w+\s*\(/.test(text)) return 'go';
 			if (/\bfn\s+\w+\s*\(|\blet\s+mut\s|\bimpl\s+\w+|\bpub\s+fn\b/.test(text)) return 'rust';
 			if (/\bpublic\s+class\b|\bSystem\.out\.println|\bpublic\s+static\s+void\s+main\b/.test(text)) return 'java';
@@ -886,7 +909,6 @@ window.__ModuleLoader__.load({
 
 		/** Install the paste rewrite; returns its disposer. */
 		function installPasteFence() {
-			let refusalReported = false;
 			const onPaste = event => {
 				if (!prefsSnapshot.enabled || !prefsSnapshot.autoFence) return;
 				// An explicit "paste as plain text" gesture asks for the text as is.
@@ -899,20 +921,26 @@ window.__ModuleLoader__.load({
 				if (data.files !== null && data.files !== undefined && data.files.length > 0) return;
 				const fenced = fenceForPaste(data.getData('text/plain'));
 				if (fenced === null) return;
-				const rewritten = pasteWithBreaks(fenced, caretAtLineStart(true));
-				try {
-					// A read-only clipboard surface would throw here; the browser's own
-					// paste then proceeds with the untouched text.
-					data.setData('text/plain', rewritten);
-				} catch (error) {
-					console.warn('[composer-md-preview] could not rewrite the pasted text', error);
+				const payload = pasteWithBreaks(fenced, caretAtLineStart(true));
+				const actions = pasteBridge.actions;
+				if (actions === undefined || typeof actions.insertText !== 'function' || typeof actions.captureInsertion !== 'function') {
+					// No live composer handle: hand the fenced text to the platform and
+					// let its own paste run. Harmless where the write is refused.
+					try {
+						data.setData('text/plain', payload);
+					} catch (error) {
+						console.warn('[composer-md-preview] could not rewrite the pasted text', error);
+					}
 					return;
 				}
-				// Read the value back once: a platform that silently ignores the write
-				// would otherwise look like a classification bug.
-				if (!refusalReported && data.getData('text/plain') !== rewritten) {
-					refusalReported = true;
-					console.warn('[composer-md-preview] this browser refuses to rewrite a pasted text; the paste is left as is');
+				// Chromium keeps the paste store read-only, so own the insertion: the
+				// shell's `insertText` writes at the captured caret in one undo step,
+				// and refuses exactly when the editor would have refused the paste.
+				const span = actions.captureInsertion();
+				event.preventDefault();
+				if (actions.insertText(payload, span) !== true) {
+					// Frozen or disposed composer: it would have dropped the paste too.
+					return;
 				}
 			};
 			document.addEventListener('paste', onPaste, true);
@@ -1258,6 +1286,10 @@ h3.dcmp-heading{font-size:1.08em}
 				UserMarkdown,
 			));
 			ctx.effect(() => installPasteFence(), 'dsh-composer-md-preview: code paste');
+			ctx.slots.inject('conversation.input.left', () => ctx.slots.register(
+				{ name: 'conversation.input.left', id: 'composer-md-preview-bridge', order: 101, locale: NS },
+				PasteBridge,
+			));
 			ctx.slots.inject('settings.general.item', () => ctx.slots.register(
 				{ name: 'settings.general.item', id: 'composer-md-preview-autofence', order: 30, locale: NS },
 				AutoFenceRow,
@@ -1272,7 +1304,7 @@ h3.dcmp-heading{font-size:1.08em}
 		exports.__internals = {
 			looksLikeMarkdown, parseInline, parseBlocks, renderBlocks,
 			PreviewDock, PreviewToggle, UserMarkdown, AutoFenceRow, readPrefs,
-			looksLikeCode, detectLanguage, fenceForPaste, pasteWithBreaks,
+			looksLikeCode, detectLanguage, fenceForPaste, pasteWithBreaks, PasteBridge, pasteBridge,
 		};
 		return module.exports;
 	},

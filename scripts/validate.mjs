@@ -203,6 +203,8 @@ check('apply registers both slot entries', () => {
 		'conversation.input.left#composer-md-preview-toggle@100',
 		'conversation.user.text.node',
 		'conversation.user.text.node#text@p50',
+		'conversation.input.left',
+		'conversation.input.left#composer-md-preview-bridge@101',
 		'settings.general.item',
 		'settings.general.item#composer-md-preview-autofence@30',
 	], 'registrations');
@@ -658,6 +660,7 @@ fenced('TypeScript', "interface Point { x: number }\nconst p: Point = { x: 1 };"
 fenced('Python', 'def add(a, b):\n    return a + b', 'python');
 fenced('C', '#include <stdio.h>\nint main(void) {\n  printf("hi");\n  return 0;\n}', 'c');
 fenced('C++', '#include <iostream>\nint main() { std::cout << "x"; }', 'cpp');
+fenced('C++ in the competitive-programming style', '#include <bits/stdc++.h>\n\nusing namespace std;\n\nint n;\nconst int N = 1e6 + 10;\n\nstruct con\n{\n    int l, r;\n} c[N];\n\nbool cmp(con a, con b)\n{\n    return a.r < b.r;\n}\n\nint main()\n{\n    scanf("%d", &n);\n    return 0;\n}', 'cpp');
 fenced('shell', 'cd /home/dsh\ngit status --short', 'bash');
 fenced('a shebang script', '#!/usr/bin/env bash\nset -e\necho hi', 'bash');
 fenced('HTML', '<div class="a">\n  <span>hi</span>\n</div>', 'html');
@@ -703,7 +706,7 @@ check('the fence is padded so it starts and ends on its own line', () => {
 	equal(pasteWithBreaks('```js\nx\n```', false), '\n\n```js\nx\n```\n', 'mid-line');
 });
 
-check('the paste handler rewrites only a composer code paste', () => {
+check('the paste handler hands fenced code to the shell', () => {
 	class FakeElement {
 		constructor({ editable = false, inComposer = true } = {}) {
 			this.isContentEditable = editable;
@@ -724,70 +727,109 @@ check('the paste handler rewrites only a composer code paste', () => {
 
 	const listener = pasteListeners[0];
 	if (listener === undefined) throw new Error('paste listener missing');
-	let rewritten = null;
-	const event = ({ text, shift = false, files = [], editable = true, inComposer = true, writable = true }) => {
-		const state = { text };
-		return {
-			shiftKey: shift,
-			target: new FakeElement({ editable, inComposer }),
-			clipboardData: {
-				files,
-				getData: () => state.text,
-				setData: (type, value) => {
-					if (type !== 'text/plain') return;
-					rewritten = value;
-					if (writable) state.text = value;
-				},
-			},
-		};
+
+	let inserted = null;
+	let captured = null;
+	let prevented = 0;
+	let setDataCalls = 0;
+	let insertResult = true;
+	const actions = {
+		captureInsertion: () => {
+			captured = { start: 3, end: 3, draftRev: 7 };
+			return captured;
+		},
+		insertText: (text, span) => {
+			inserted = { text, span };
+			return insertResult;
+		},
 	};
-	const reset = () => { rewritten = null; };
+	internals.PasteBridge({ inputActions: actions });
+
 	const code = 'const a = 1;\nconst b = 2;';
+	const event = ({ text, shift = false, files = [], editable = true, inComposer = true }) => ({
+		shiftKey: shift,
+		target: new FakeElement({ editable, inComposer }),
+		preventDefault: () => { prevented += 1; },
+		clipboardData: {
+			files,
+			getData: () => text,
+			setData: () => { setDataCalls += 1; },
+		},
+	});
+	const reset = () => {
+		inserted = null;
+		captured = null;
+		prevented = 0;
+		setDataCalls = 0;
+	};
 
 	reset();
 	listener(event({ text: code }));
-	equal(rewritten, '```javascript\nconst a = 1;\nconst b = 2;\n```\n', 'composer code paste');
+	equal(prevented, 1, 'default paste prevented');
+	equal(inserted?.text, '```javascript\nconst a = 1;\nconst b = 2;\n```\n', 'inserted payload');
+	equal(inserted?.span, captured, 'the caret is captured before inserting');
+	equal(setDataCalls, 0, 'clipboard left alone when the shell can insert');
 
 	reset();
 	listener(event({ text: code, shift: true }));
-	equal(rewritten, null, 'shift paste');
+	equal(prevented, 0, 'shift paste prevented?');
+	equal(inserted, null, 'shift paste inserted?');
 
 	reset();
 	listener(event({ text: code, inComposer: false }));
-	equal(rewritten, null, 'paste outside the composer');
+	equal(inserted, null, 'paste outside the composer');
 
 	reset();
 	listener(event({ text: code, editable: false }));
-	equal(rewritten, null, 'paste outside the editor');
+	equal(inserted, null, 'paste outside the editor');
 
 	reset();
 	listener(event({ text: code, files: [{}] }));
-	equal(rewritten, null, 'paste carrying files');
+	equal(inserted, null, 'paste carrying files');
 
 	reset();
 	listener(event({ text: '一段普通的文字\n还有第二行' }));
-	equal(rewritten, null, 'prose');
+	equal(inserted, null, 'prose');
+
+	reset();
+	insertResult = false;
+	listener(event({ text: code }));
+	equal(prevented, 1, 'a refusing shell still consumed the default paste');
+	insertResult = true;
 
 	reset();
 	storage.set('dsh-composer-md-preview/v1', JSON.stringify({ enabled: true, collapsed: false, autoFence: false }));
 	internals.readPrefs();
 	listener(event({ text: code }));
-	equal(rewritten, null, 'auto-fence switched off in Settings');
+	equal(inserted, null, 'auto-fence switched off in Settings');
 
+	reset();
 	storage.set('dsh-composer-md-preview/v1', JSON.stringify({ enabled: false, collapsed: false, autoFence: true }));
 	internals.readPrefs();
 	listener(event({ text: code }));
-	equal(rewritten, null, 'master switch off');
+	equal(inserted, null, 'master switch off');
 
+	reset();
 	storage.set('dsh-composer-md-preview/v1', JSON.stringify({ enabled: true, collapsed: false, autoFence: true }));
 	internals.readPrefs();
 	listener(event({ text: code }));
-	equal(typeof rewritten, 'string', 'back on');
+	equal(typeof inserted?.text, 'string', 'back on');
 
-	// A clipboard that silently ignores the write must not throw or loop.
+	// With no live composer handle the paste is left to the browser.
+	internals.PasteBridge({ inputActions: undefined });
 	reset();
-	listener(event({ text: code, writable: false }));
-	equal(typeof rewritten, 'string', 'a refusing clipboard still attempts the write');
+	listener(event({ text: code }));
+	equal(prevented, 0, 'no shell handle leaves the native paste');
+	equal(setDataCalls, 1, 'clipboard rewrite attempted instead');
+	internals.PasteBridge({ inputActions: actions });
+});
+
+check('the bridge publishes the composer actions and renders nothing', () => {
+	equal(internals.PasteBridge({ inputActions: undefined }), null, 'renders nothing');
+	equal(internals.pasteBridge.actions, undefined, 'cleared without actions');
+	const actions = { insertText: () => true };
+	equal(internals.PasteBridge({ inputActions: actions }), null, 'still nothing');
+	equal(internals.pasteBridge.actions, actions, 'published');
 });
 
 check('the Settings row toggles the paste rewrite', () => {

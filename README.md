@@ -61,10 +61,11 @@ before:  function f() { return 1 }        after:  ```javascript
 - **Escapes.** Hold **Shift** while pasting (`Ctrl+Shift+V` / `⇧⌘V`) to keep the
   text verbatim. You can also turn the rewrite off in **Settings → General →
   Fence pasted code**; the switch is remembered per browser.
-- **Nothing is destroyed.** The rewrite only changes what the editor receives for
-  that one paste; undo removes it like any other paste. If the platform refuses
-  the rewrite (a clipboard carrying files, or a browser that locks the paste
-  surface), the raw text lands and the feature simply does not engage.
+- **Nothing is destroyed.** The insert goes through the shell's own
+  `insertText` action at the captured caret, so it is one undo step; if the
+  composer is busy or the paste carries files, the paste is left to the browser.
+  Chromium keeps the paste clipboard read-only, which is why the plugin inserts
+  the fenced block instead of rewriting the clipboard.
 - Already-fenced text is never re-wrapped.
 
 ## Where it appears
