@@ -27,10 +27,12 @@ Two halves of one idea — your Markdown reads as Markdown, not as markers.
 1. **The input box renders the draft.** When the draft contains Markdown
    syntax, the rendered version **replaces** the raw text inside the composer
    card: the box shows the message as it will read, with a tool row under it,
-   and no second surface anywhere. Click the rendered text to edit — the raw
-   line comes back, exactly where the shell drew it — and click outside to see
-   it rendered again. Plain prose, or the switch turned off, leaves the input
-   box untouched.
+   and no second surface anywhere. The first keystroke brings the raw line
+   back, exactly where the shell drew it, and the rendering returns after 0.7 s
+   of quiet — so a focused composer shows its source while you type and its
+   rendering while you think. Clicking the rendered text also returns to
+   editing. Plain prose, or the switch turned off, leaves the input box
+   untouched.
 2. **Sent messages.** A message you send renders as Markdown in the
    conversation, in the same bubble as before, using the same renderer as the
    draft card. Assistant messages were always rendered; now your own messages
@@ -128,9 +130,9 @@ or reference-style links, and reference-style definitions render literally.
 
 - **输入框直接渲染**：草稿里出现 Markdown 语法（且开关打开）时，输入框里显示的
   就是渲染结果——原文行被收起来，同一个卡片、同一个内边距和圆角，卡片下面还是
-  发送那一行工具条，没有任何第二块面板。**点一下渲染结果就能回到原文编辑**，
-  光标回到原来的位置；点到卡片外面，又重新渲染。普通文字或关掉开关时，输入框
-  和原厂一模一样。
+  发送那一行工具条，没有任何第二块面板。**一敲键盘就变回原文编辑**（光标原地
+  不动），**停手 0.7 秒又变回渲染结果**——打字时看源码、想事情时看效果；点一下
+  渲染结果也能回到编辑。普通文字或关掉开关时，输入框和原厂一模一样。
 - **已发送消息**：发送出去的消息在对话里也按 Markdown 渲染（和助手消息一样），
   位置和气泡样式不变。
 - **粘贴代码自动加代码块**：把一段代码粘进输入框，会自动包成围栏代码块并尽量标上

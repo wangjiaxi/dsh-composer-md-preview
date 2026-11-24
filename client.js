@@ -39,6 +39,8 @@ window.__ModuleLoader__.load({
 		const NS = 'dsh-composer-md-preview';
 		/** localStorage key holding the two persisted preferences. */
 		const STORAGE_KEY = 'dsh-composer-md-preview/v1';
+		/** Quiet time before a focused composer swaps its source for the rendering. */
+		const IDLE_MS = 700;
 		/** Text longer than this is not rendered: this is a reading aid, not a document viewer. */
 		const MAX_RENDER_CHARS = 50000;
 
@@ -808,19 +810,42 @@ window.__ModuleLoader__.load({
 					setFocused(false);
 				};
 				setFocused(isEditor(document.activeElement));
+				// Restore the source in the same event as the first keystroke: the
+				// attribute is dropped imperatively so the editor has its height back
+				// before the character is inserted, with no frame of blind typing.
+				const onKeyDown = () => {
+					if (card.hasAttribute('data-dcmp-reading')) card.removeAttribute('data-dcmp-reading');
+					setIdle(false);
+				};
 				card.addEventListener('focusin', onFocusIn);
 				card.addEventListener('focusout', onFocusOut);
+				card.addEventListener('keydown', onKeyDown, true);
 				return () => {
 					card.removeEventListener('focusin', onFocusIn);
 					card.removeEventListener('focusout', onFocusOut);
+					card.removeEventListener('keydown', onKeyDown, true);
 				};
 			}, []);
 
+			// A focused composer renders too, but only while it is quiet: the first
+			// keystroke swaps the source back in, so typing never happens blind.
+			const hasDraft = typeof draft === 'string' && draft.trim() !== '';
+			const markdown = prefsNow.enabled && hasDraft && looksLikeMarkdown(draft);
+			const [idle, setIdle] = React.useState(false);
+			React.useEffect(() => {
+				setIdle(false);
+				if (!focused || !markdown) return undefined;
+				const timer = window.setTimeout(() => setIdle(true), IDLE_MS);
+				return () => {
+					window.clearTimeout(timer);
+				};
+			}, [draft, focused, markdown]);
+
+			const reading = host !== null && markdown && (idle || !focused);
 			const panel = React.useMemo(
-				() => (focused || host === null ? null : draftPanel({ draft, enabled: prefsNow.enabled, translate })),
-				[focused, host, draft, prefsNow.enabled, translate],
+				() => (reading ? draftPanel({ draft, enabled: prefsNow.enabled, translate }) : null),
+				[reading, draft, prefsNow.enabled, translate],
 			);
-			const reading = panel !== null;
 			// Layout effect: the editing line collapses in the same frame the panel
 			// mounts, so the card never paints an empty middle.
 			React.useLayoutEffect(() => {
