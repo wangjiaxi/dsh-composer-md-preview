@@ -38,7 +38,7 @@ window.__ModuleLoader__.load({
 		/** Locale namespace owned by this plugin. */
 		const NS = 'dsh-composer-md-preview';
 		/** Build identity, registered by an invisible entry so a live page can be told apart. */
-		const VERSION = '0.6.1';
+		const VERSION = '0.6.2';
 		/** localStorage key holding the two persisted preferences. */
 		const STORAGE_KEY = 'dsh-composer-md-preview/v1';
 		/** Quiet time before a focused composer swaps its source for the rendering. */
@@ -1219,8 +1219,12 @@ window.__ModuleLoader__.load({
 .dcmp-anchor{display:none}
 .dcmp-host{order:-1;display:block;flex:none;min-width:0}
 .dcmp-host:empty{display:none}
+/* The collapsed editor and the invisible overlay seat still count for the card's
+   gap, so the gap is zeroed and the spacing lives in the panel's own padding:
+   no negative offset can pull a pasted image rail under the rendering. */
 [data-composer-card][data-dcmp-reading] [contenteditable]{height:0;min-height:0;overflow:hidden;padding:0;border:0}
-[data-composer-card][data-dcmp-reading]>.dcmp-host{margin-bottom:-24px}
+[data-composer-card][data-dcmp-reading]{gap:0}
+[data-composer-card][data-dcmp-reading]>.dcmp-host{padding-bottom:12px}
 .dcmp-inline-preview{box-sizing:border-box;min-width:0;cursor:text;max-height:min(40vh,320px);overflow:hidden auto;padding:4px 14px 0;font-size:var(--dsh-content-font-size,14px);line-height:calc(24px + var(--dsh-content-font-delta,0px));color:var(--dsw-alias-label-primary,inherit);--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2,rgb(0 0 0/16%));--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2,rgb(0 0 0/28%));animation:dcmp-fade 160ms ease-out}
 @keyframes dcmp-fade{from{opacity:0}to{opacity:1}}
 @media (prefers-reduced-motion:reduce){.dcmp-inline-preview{animation:none}}
